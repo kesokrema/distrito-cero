@@ -921,7 +921,8 @@ export class NPCController {
           if (this.prefabs.interiorObstacleAt(x, z, source.group.position.y)) { separated = true; break; }
         }
         if (separated) continue;
-        const exposure = dt * (distance < 1.5 ? 4 : 2);
+        const sociability = this.grid.hash(listener.id, 918, 301);
+        const exposure = dt * (distance < 1.5 ? 4 : 2) * (0.78 + sociability * 0.62);
         const prior = contacts.get(listener);
         contacts.set(listener, { source: prior?.source || source, exposure: (prior?.exposure || 0) + exposure });
       }
@@ -930,11 +931,13 @@ export class NPCController {
       if (!npc.alive || npc.kind !== 'civilian' || npc.state === 'flee' || npc.state === 'hide') continue;
       const contact = contacts.get(npc);
       npc.socialExposure = Math.max(0, (npc.socialExposure || 0) + (contact?.exposure || -dt * 1.5));
-      if (!contact || npc.socialExposure < 0.6) continue;
+      const resilience = this.grid.hash(npc.id, 918, 302);
+      if (!contact || npc.socialExposure < 0.38 + resilience * 0.72) continue;
       npc.socialExposure = 0;
       npc.state = 'flee';
-      npc.panic = Math.max(npc.panic, 0.55);
-      npc.fearTime = 0.55;
+      npc.panic = Math.max(npc.panic, 0.48 + this.grid.hash(npc.id, 918, 303) * 0.3);
+      npc.fearTime = 0.32 + this.grid.hash(npc.id, 918, 304) * 0.74;
+      npc.markerTime = Math.max(npc.markerTime, 2.6 + this.grid.hash(npc.id, 918, 305) * 2.1);
       const source = contact.source;
       npc.group.rotation.y = Math.atan2(source.group.position.x - npc.group.position.x,
         source.group.position.z - npc.group.position.z);
