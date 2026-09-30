@@ -11,7 +11,7 @@ import { DestructionSystem } from '../world/DestructionSystem';
 export type DriveInput = { forward: boolean; reverse: boolean; left: boolean; right: boolean; handbrake: boolean };
 type TrafficTurn = { axis: 'x' | 'z'; direction: number; progress: number; radius: number; start: THREE.Vector2; control: THREE.Vector2; end: THREE.Vector2 };
 type TrafficState = { axis: 'x' | 'z'; direction: number; speed: number; cruiseSpeed: number; seed: number;
-  turn: TrafficTurn | null; panicTime: number; danger: THREE.Vector2 | null };
+  turn: TrafficTurn | null; panicTime: number; danger: THREE.Vector2 | null; blockedTime: number; };
 type ImpactMotion = { velocity: THREE.Vector2; parkWhenSettled: boolean };
 
 function overlapsVehicle(a: { x: number; z: number; y:number; yaw: number; length: number; width: number }, b: THREE.Group): boolean {
@@ -77,8 +77,7 @@ export class VehicleSystem {
       const far = car.position.distanceToSquared(player.group.position) > 24 * 24;
       const [gx, gz] = this.grid.grid(car.position.x, car.position.z);
       const presence = this.grid.hash(gx, gz, state.seed + 902);
-      if (presence > this.streetActivity && far && state.panicTime <= 0 && car !== this.active) car.userData.offDutyTraffic = true;
-      else if (presence <= this.streetActivity || state.panicTime > 0) car.userData.offDutyTraffic = false;
+      car.userData.offDutyTraffic = presence > this.streetActivity && far && state.panicTime <= 0 && car !== this.active;
     }
     this.vehicleSpatial.rebuild(this.prefabs.vehicles.filter((vehicle) => !vehicle.userData.destroyed && !vehicle.userData.offDutyTraffic &&
       (vehicle === this.active || this.prefabs.isWorldActive(vehicle.position.x, vehicle.position.z))));
@@ -106,8 +105,20 @@ export class VehicleSystem {
         const dx = 2 * inverse * (turn.control.x - turn.start.x) + 2 * progress * (turn.end.x - turn.control.x);
         const dz = 2 * inverse * (turn.control.y - turn.start.y) + 2 * progress * (turn.end.y - turn.control.y);
         const yaw = Math.atan2(dx, dz);
-        if (!cell?.active || cell.tile !== 'road' || cell.rubble || !this.vehicleFits(car, x, z, yaw) || this.vehicleSpatial.nearby(x, z, 6).some((other) =>
-          other !== car && overlapsVehicle({ x, z, y:car.position.y, yaw, length: specs.length, width: specs.width }, other))) continue;
+        const blocked = !cell?.active || cell.tile !== 'road' || cell.rubble || !this.vehicleFits(car, x, z, yaw) || this.vehicleSpatial.nearby(x, z, 6).some((other) =>
+          other !== car && overlapsVehicle({ x, z, y:car.position.y, yaw, length: specs.length, width: specs.width }, other));
+        if (blocked) {
+          state.blockedTime += dt;
+          if (state.blockedTime > 2.4) {
+            // A blocked turning arc must not freeze the entire lane forever.
+            // Abandon the arc and yield by reversing along the current street.
+            state.turn = null;
+            state.direction *= -1;
+            state.blockedTime = 0;
+          }
+          continue;
+        }
+        state.blockedTime = 0;
         car.position.set(x, car.position.y, z);
         turn.progress = progress;
         car.rotation.y = Math.atan2(dx, dz);
@@ -127,6 +138,15 @@ export class VehicleSystem {
       const moved = !!(nextCell?.active && nextCell.tile === 'road' && !nextCell.rubble && this.vehicleFits(car, nextX, nextZ, target) && !obstacle);
       if (moved) {
         car.position.set(nextX, car.position.y, nextZ);
+        state.blockedTime = 0;
+      } else {
+        state.blockedTime += dt;
+        if (state.blockedTime > 2.4) {
+          // Let a vehicle escape a queue or a stale turn reservation. It keeps
+          // to the road and changes direction instead of remaining parked.
+          state.direction *= -1;
+          state.blockedTime = 0;
+        }
       }
       const delta = Math.atan2(Math.sin(target - car.rotation.y), Math.cos(target - car.rotation.y));
       car.rotation.y += delta * Math.min(1, dt * 4.5);
@@ -143,7 +163,7 @@ export class VehicleSystem {
       const cruiseSpeed = 3.5 + this.grid.hash(gx, gz, 392) * 2.4;
       this.traffic.set(car, {
         axis: car.userData.trafficAxis as 'x' | 'z', direction: car.userData.trafficDirection as number,
-        speed: cruiseSpeed, cruiseSpeed, seed: index + 393, turn: null, panicTime: 0, danger: null
+        speed: cruiseSpeed, cruiseSpeed, seed: index + 393, turn: null, panicTime: 0, danger: null, blockedTime: 0
       });
     }
     this.knownVehicleCount = this.prefabs.vehicles.length;

@@ -898,6 +898,10 @@ test('targeted hits knock NPCs down, repeated limb hits detach, and lost legs pr
   assert.ok(handBefore.distanceTo(legNpc.ragdoll.joints[6].position) > 0.02, 'the grounded NPC still moves an arm');
   assert.ok(pelvisBefore.distanceTo(ragdolls.pelvis(legNpc.ragdoll)) > 0.08,
     'a wounded NPC must actually crawl across the ground');
+  const pelvisAfter = ragdolls.pelvis(legNpc.ragdoll);
+  const handAfter = legNpc.ragdoll.joints[6].position.clone();
+  assert.ok(handBefore.clone().sub(pelvisBefore).distanceTo(handAfter.sub(pelvisAfter)) > 0.06,
+    'the crawl must visibly alternate its arm stroke instead of translating as a stiff body');
   controller.damage(legNpc, 0.39, 'leftShin', undefined, 2.2);
   assert.ok(legNpc.alive && legNpc.missing?.has('leftShin') && legNpc.missing.has('rightShin'),
     'a crawling NPC can lose the other leg while still alive');

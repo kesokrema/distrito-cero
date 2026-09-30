@@ -38,6 +38,8 @@ export type NPC = {
   socialExposure?: number;
   offDuty?: boolean;
   velocity?: THREE.Vector3; fireTime?: number; groundPhysics?:GroundPhysics;
+  blockedMoveTime?: number;
+  detourCell?: number;
 };
 
 export class NPCController {
@@ -701,8 +703,7 @@ export class NPCController {
       const distanceSquared = npc.group.position.distanceToSquared(playerPosition);
       if (npc.kind === 'civilian' && !npc.indoorAnchor && !npc.ragdoll && npc.state !== 'flee' && npc.panic < 0.2) {
         const presence = this.grid.hash(npc.id, 0, 817);
-        if (presence > this.streetActivity && distanceSquared > 18 * 18) npc.offDuty = true;
-        else if (presence <= this.streetActivity) npc.offDuty = false;
+        npc.offDuty = presence > this.streetActivity && distanceSquared > 18 * 18;
       }
       if (npc.state === 'flee' || npc.panic >= 0.2) npc.offDuty = false;
       if (npc.offDuty) {
@@ -1009,12 +1010,13 @@ export class NPCController {
       this.animate(npc, rig, dt, false, false);
       return;
     }
-    const index = npc.path[npc.pathIndex];
+    const index = npc.detourCell ?? npc.path[npc.pathIndex];
     if (index === undefined) { npc.velocity?.multiplyScalar(Math.exp(-dt * 7)); this.animate(npc, rig, dt, false, false); return; }
     const [x, z] = this.grid.world(index % this.grid.size, Math.floor((index%(this.grid.size*this.grid.size)) / this.grid.size));
     const direction = new THREE.Vector3(x - npc.group.position.x, 0, z - npc.group.position.z);
     if (direction.length() < 0.18 || (direction.length() < 0.95 && this.grid.walkable(x, z) && !this.canOccupy(npc, x, z))) {
-      npc.pathIndex++;
+      if (npc.detourCell !== undefined) npc.detourCell = undefined;
+      else npc.pathIndex++;
       if (npc.kind === 'civilian' && npc.pathIndex >= npc.path.length) {
         if (npc.state === 'flee' && npc.hideTarget === npc.target) {
           npc.state = 'hide'; npc.hideTime = 2.5 + this.grid.hash(npc.id, Math.floor(this.simulationTime), 613) * 2.5;
@@ -1053,8 +1055,34 @@ export class NPCController {
       moved = true;
       break;
     }
-    if (!moved) { npc.reroute = Math.min(npc.reroute, 0.35); npc.velocity.multiplyScalar(0.35); }
-    else npc.velocity.set(Math.sin(heading) * step / Math.max(dt, 0.001), 0, Math.cos(heading) * step / Math.max(dt, 0.001));
+    if (!moved) {
+      npc.blockedMoveTime = (npc.blockedMoveTime || 0) + dt;
+      npc.reroute = Math.min(npc.reroute, 0.35);
+      npc.velocity.multiplyScalar(0.35);
+      if (npc.blockedMoveTime > 0.42) {
+        const [gx, gz] = this.grid.grid(npc.group.position.x, npc.group.position.z);
+        let best: { cell: number; score: number } | undefined;
+        for (let radius = 1; radius <= 2; radius++) for (let dz = -radius; dz <= radius; dz++) for (let dx = -radius; dx <= radius; dx++) {
+          if (Math.max(Math.abs(dx), Math.abs(dz)) !== radius) continue;
+          const cell = this.grid.cell(gx + dx, gz + dz);
+          if (!cell?.active || cell.blocked || cell.rubble) continue;
+          const [cx, cz] = this.grid.world(cell.x, cell.z);
+          if (!this.canOccupy(npc, cx, cz)) continue;
+          const toward = new THREE.Vector2(x - npc.group.position.x, z - npc.group.position.z);
+          const candidate = new THREE.Vector2(cx - npc.group.position.x, cz - npc.group.position.z);
+          const score = candidate.dot(toward.clone().normalize()) - candidate.distanceTo(toward.clone().normalize().multiplyScalar(1.4)) * 0.18 + this.grid.hash(cell.x, cell.z, npc.id) * 0.08;
+          if (!best || score > best.score) best = { cell: this.grid.index(cell.x, cell.z), score };
+        }
+        if (best) {
+          npc.detourCell = best.cell;
+          npc.blockedMoveTime = 0;
+          npc.velocity.set(0, 0, 0);
+        }
+      }
+    } else {
+      npc.blockedMoveTime = 0;
+      npc.velocity.set(Math.sin(heading) * step / Math.max(dt, 0.001), 0, Math.cos(heading) * step / Math.max(dt, 0.001));
+    }
     if (npc.kind === 'enemy' && (npc.state === 'chase' || npc.state === 'flank' || npc.state === 'cover') && npc.group.position.distanceToSquared(this.player.position) < 32 * 32)
       heading = Math.atan2(this.player.position.x - npc.group.position.x, this.player.position.z - npc.group.position.z);
     const turn = Math.atan2(Math.sin(heading - npc.group.rotation.y), Math.cos(heading - npc.group.rotation.y));

@@ -345,7 +345,9 @@ export class RagdollSystem {
       }
       if (body.crawling) {
         body.crawlAge += step;
-        if (body.crawlAge > 0.45) this.crawl(body, step, nearbyVehicles);
+        // Start the crawl pose as soon as leg loss incapacitates the actor;
+        // waiting made wounded NPCs look like ordinary static ragdolls.
+        this.crawl(body, step, nearbyVehicles);
       }
       for (let iteration = 0; iteration < 7; iteration++) {
         for (const constraint of body.constraints) {
@@ -441,7 +443,7 @@ export class RagdollSystem {
       Number(!body.missing.has('rightUpperArm') && !body.missing.has('rightForearm'));
     const bothLegs = (body.missing.has('leftThigh') || body.missing.has('leftShin')) &&
       (body.missing.has('rightThigh') || body.missing.has('rightShin'));
-    const speed = (bothLegs ? 0.38 : 0.62) * (intactArms === 2 ? 1 : intactArms === 1 ? 0.55 : 0.12);
+    const speed = (bothLegs ? 0.56 : 0.82) * (intactArms === 2 ? 1 : intactArms === 1 ? 0.55 : 0.12);
     const distance = speed * step;
     const right = new THREE.Vector3(direction.z, 0, -direction.x);
     // Sweep the whole prone silhouette, including the front of the head.
@@ -471,8 +473,9 @@ export class RagdollSystem {
     }
     for (const [side, elbow, wrist, missing] of [[-1, 5, 6, 'leftForearm'], [1, 8, 9, 'rightForearm']] as const) {
       if (body.missing.has(missing) || body.missing.has(side < 0 ? 'leftUpperArm' : 'rightUpperArm')) continue;
-      const stroke = Math.sin(body.crawlAge * 8 + (side < 0 ? 0 : Math.PI));
-      for (const [index, forward, height] of [[elbow, 0.4, 0.23], [wrist, 0.56 + stroke * 0.16, 0.13 + Math.max(0, stroke) * 0.08]] as const) {
+      const stroke = Math.sin(body.crawlAge * 7.2 + (side < 0 ? 0 : Math.PI));
+      for (const [index, forward, height] of [[elbow, 0.34 + stroke * 0.12, 0.25],
+        [wrist, 0.62 + stroke * 0.3, 0.12 + Math.max(0, stroke) * 0.13]] as const) {
         const point = body.joints[index].position;
         const targetX = anchor.x + direction.x * forward + right.x * side * 0.42;
         const targetZ = anchor.z + direction.z * forward + right.z * side * 0.42;
