@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Distrito Cero · Prueba de rig</title>
+    <style>
+      :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+      * { box-sizing: border-box; }
+      html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #b8ccda; }
+      canvas { display: block; width: 100%; height: 100%; }
+      .panel { position: fixed; z-index: 2; top: 18px; left: 18px; width: min(370px, calc(100vw - 36px));
+        padding: 18px; color: #f4f1e9; background: #172731e8; border: 1px solid #a5c2c148; border-radius: 14px;
+        box-shadow: 0 12px 34px #101a2480; backdrop-filter: blur(12px); }
+      h1 { margin: 0 0 5px; font-size: 17px; letter-spacing: .08em; }
+      p { margin: 0; color: #c1d0d4; font-size: 12px; line-height: 1.5; }
+      .buttons { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 14px; }
+      button { border: 1px solid #718a91; border-radius: 8px; padding: 8px 10px; color: #eaf0ed; background: #243942;
+        font: inherit; font-size: 10px; font-weight: 700; letter-spacing: .08em; cursor: pointer; }
+      button[aria-pressed="true"] { color: #092c2e; border-color: #59d9c0; background: #63ddc4; }
+      #status { min-height: 18px; margin-top: 11px; color: #91e3d4; font-size: 11px; }
+      .hint { position: fixed; z-index: 2; right: 16px; bottom: 14px; color: #19343c; font-size: 11px;
+        background: #edf3e7d9; padding: 8px 10px; border-radius: 8px; }
+    </style>
+  </head>
+  <body>
+    <section class="panel" aria-label="Prueba de rig y animaciones">
+      <h1>PRUEBA VISUAL DEL RIG</h1>
+      <p>Primero comprueba que la T pose forme una figura simétrica, con brazos horizontales y articulaciones alineadas. Después compara el reposo y la locomoción.</p>
+      <div class="buttons">
+        <button data-pose="tpose" aria-pressed="true">T POSE</button>
+        <button data-pose="idle" aria-pressed="false">IDLE</button>
+        <button data-pose="walk" aria-pressed="false">WALK</button>
+        <button data-pose="run" aria-pressed="false">RUN</button>
+        <button data-pose="aim" aria-pressed="false">AIM</button>
+      </div>
+      <div id="status" role="status">Preparando el rig…</div>
+    </section>
+    <div class="hint">Arrastra para orbitar · rueda para acercar</div>
+    <script type="module" src="/src/rig-preview.ts"></script>
+  </body>
+</html>

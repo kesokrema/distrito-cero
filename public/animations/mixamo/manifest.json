@@ -1,0 +1,53 @@
+{
+  "clips": [
+    {
+      "id": "idle",
+      "file": "idle.fbx",
+      "states": [
+        "idle"
+      ]
+    },
+    {
+      "id": "walk",
+      "file": "walk.fbx",
+      "states": [
+        "walk"
+      ]
+    },
+    {
+      "id": "run",
+      "file": "run.fbx",
+      "states": [
+        "run"
+      ]
+    },
+    {
+      "id": "fear",
+      "file": "fear.fbx",
+      "states": [
+        "fear"
+      ]
+    },
+    {
+      "id": "aim",
+      "file": "aim.fbx",
+      "states": [
+        "aim"
+      ]
+    },
+    {
+      "id": "fire",
+      "file": "fire.fbx",
+      "states": [
+        "fire"
+      ]
+    },
+    {
+      "id": "crouch",
+      "file": "crouch.fbx",
+      "states": [
+        "crouch"
+      ]
+    }
+  ]
+}
