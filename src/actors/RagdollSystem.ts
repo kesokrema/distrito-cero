@@ -448,16 +448,16 @@ export class RagdollSystem {
     const right = new THREE.Vector3(direction.z, 0, -direction.x);
     // Sweep the whole prone silhouette, including the front of the head.
     const canAdvance = this.crawlSamplesClear(body, distance, floor, nearbyVehicles);
-    if (!canAdvance) {
+    if (canAdvance) {
+      for (const joint of body.joints) {
+        joint.position.x += direction.x * distance; joint.position.z += direction.z * distance;
+        joint.previous.x += direction.x * distance; joint.previous.z += direction.z * distance;
+      }
+    } else {
       for (const joint of body.joints) {
         joint.previous.x = joint.position.x;
         joint.previous.z = joint.position.z;
       }
-      return;
-    }
-    for (const joint of body.joints) {
-      joint.position.x += direction.x * distance; joint.position.z += direction.z * distance;
-      joint.previous.x += direction.x * distance; joint.previous.z += direction.z * distance;
     }
     // Let gravity and the joint solver finish the fall, then guide the trunk
     // into a low prone silhouette. Hands reach alternately and drag the torso.

@@ -558,6 +558,28 @@ test('real chunks retain precise damage, open entrances, floor coverage and boun
   assert.ok(world.interiorPiecesNear(vehicle.position.x, vehicle.position.z, 4).some(belongsToVehicle));
   vehicle.position.copy(vehiclePosition); vehicle.updateWorldMatrix(true, true);
   const collisionDamage = new DestructionSystem(scene, grid, world, new EventBus());
+  const roadCell = grid.activeCells.find((cell) => cell.tile === 'road' &&
+    !grid.terrain.waterAt(...grid.world(cell.x, cell.z)));
+  assert.ok(roadCell, 'the generated neighborhood contains an ordinary road surface');
+  const [roadX, roadZ] = grid.world(roadCell!.x, roadCell!.z);
+  const roadHeight = grid.groundHeight(roadX, roadZ);
+  const groundChunk = world.groundMeshesNear(roadX, roadZ, 0.1)[0];
+  assert.ok(groundChunk, 'the road has a rendered terrain chunk');
+  const roadPixels = groundChunk!.userData.groundPixels as Uint8Array;
+  const groundBounds = groundChunk!.userData.groundBounds as { x0: number; z0: number; width: number; depth: number; size: number };
+  const pixelIndex = (Math.floor((roadZ - groundBounds.z0) / groundBounds.size) * groundBounds.width +
+    Math.floor((roadX - groundBounds.x0) / groundBounds.size)) * 4;
+  const roadPixelBefore = [...roadPixels.slice(pixelIndex, pixelIndex + 3)];
+  assert.equal(collisionDamage.damageRoadSurface(roadX, roadZ, 3), true, 'street surface accepts projectile damage');
+  assert.notDeepEqual([...roadPixels.slice(pixelIndex, pixelIndex + 3)], roadPixelBefore,
+    'the damaged voxel surface is visibly replaced by a darker exposed layer');
+  assert.equal(grid.groundHeight(roadX, roadZ), roadHeight, 'destroying one road voxel leaves the ground support intact');
+  const canalBounds = grid.terrain.canalBounds();
+  const canalX = (canalBounds.x0 + canalBounds.x1) / 2;
+  const canalZ = grid.world(grid.center, grid.roadZ[4] + 4)[1];
+  if (grid.terrain.waterAt(canalX, canalZ)) {
+    assert.equal(collisionDamage.damageRoadSurface(canalX, canalZ, 3), false, 'canal water cannot be damaged as a road voxel');
+  }
   const vehiclePiece = world.vehicleDamageParts(vehicle)[0];
   const initialVoxels = vehiclePiece.mask.reduce((sum, value) => sum + value, 0);
   const removedByCrash = collisionDamage.damageVehicleImpact(vehicle,
@@ -690,6 +712,17 @@ test('real chunks retain precise damage, open entrances, floor coverage and boun
   const stats = world.streamingStats();
   console.log(JSON.stringify({ generationAndRevisitTestMs: Math.round(performance.now() - started), ...stats, shellTriangleReduction: +(1 - initial.shellTriangles / initial.unmergedShellTriangles).toFixed(4), groundTriangleReduction: +(1 - initial.groundTriangles / initial.unmergedGroundTriangles).toFixed(4), floorTriangleReduction: +(1 - floorTriangles / floorOriginalTriangles).toFixed(4), detailTriangleReduction: +(1 - detailTriangles / detailOriginalTriangles).toFixed(4) }));
   world.dispose();
+});
+
+test('vehicle voxel collision probes stop a car at a solid scenery voxel', () => {
+  const prefabProbe = { interiorObstacleAt: (x: number, _z: number, _y: number) => x > 0.7 };
+  const clear = (PrefabManager.prototype.vehicleSpaceClear as unknown as Function)
+    .call(prefabProbe, 0, 0, Math.PI / 2, 4, 1.8, 0) as boolean;
+  assert.equal(clear, false, 'a voxel in the swept vehicle footprint blocks movement');
+  prefabProbe.interiorObstacleAt = () => false;
+  const open = (PrefabManager.prototype.vehicleSpaceClear as unknown as Function)
+    .call(prefabProbe, 0, 0, Math.PI / 2, 4, 1.8, 0) as boolean;
+  assert.equal(open, true, 'the same vehicle can pass once the obstructing voxel is removed');
 });
 
 test('a moving car dents both vehicles and pushes the struck car along the road', () => {
@@ -1050,6 +1083,10 @@ test('crawling bodies stop before furniture, walls and vehicle footprints', () =
   for (let i = 0; i < 360; i++) system.update(1 / 60);
   assert.ok(system.pelvis(byWall).x < 1.25, 'head and arms must stop before the wall rather than letting the pelvis clip through');
   assert.ok(system.pelvis(byVehicle).x < 1.25, 'a car footprint must block the full crawling silhouette');
+  const wristBefore = byWall.joints[6].position.y;
+  for (let i = 0; i < 18; i++) system.update(1 / 60);
+  assert.notEqual(byWall.joints[6].position.y, wristBefore,
+    'a crawler keeps reaching and pulling even when an obstacle prevents forward movement');
   system.remove(byWall); system.remove(byVehicle);
 });
 

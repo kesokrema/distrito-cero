@@ -161,13 +161,16 @@ export class CombatSystem {
         return index !== null && this.prefabs.voxels[index]?.alive;
       });
       const interiorHit = this.raycaster.intersectObjects(interiorMeshes, false)[0];
+      const groundHit = this.raycaster.intersectObjects(
+        this.prefabs.groundMeshesNear?.(origin.x, origin.z, maxRange) ?? [], false)[0];
       const npcHit = this.npcs.raycast(this.raycaster);
       const end = origin.clone().addScaledVector(direction, maxRange);
       const voxelDistance = voxelHit?.distance ?? Infinity;
       const npcDistance = npcHit?.distance ?? Infinity;
       const interiorDistance = interiorHit?.distance ?? Infinity;
+      const groundDistance = groundHit?.distance ?? Infinity;
       const damage = gun === 'rifle' ? 1.85 : gun === 'pistol' ? 1.16 : gun === 'shotgun' ? 0.39 : 0.44;
-      if (npcHit && npcDistance < voxelDistance && npcDistance < interiorDistance) {
+      if (npcHit && npcDistance < voxelDistance && npcDistance < interiorDistance && npcDistance < groundDistance) {
         const selected = pellet === 0 && selectedPart?.npc === npcHit.npc ? selectedPart : null;
         const hitPoint = selected?.point || npcHit.point;
         const hitPart = selected?.part || npcHit.part;
@@ -178,16 +181,19 @@ export class CombatSystem {
         // The hit point lies on the near surface: spray out toward the shooter
         // so the first particles do not start inside a body or the wall behind it.
         this.blood.emit(hitPoint, direction.clone().negate(), gun === 'shotgun' ? 6 : 11, npcHit.npc.group.position.y);
-      } else if (interiorHit && interiorDistance < voxelDistance) {
+      } else if (interiorHit && interiorDistance < voxelDistance && interiorDistance < groundDistance) {
         end.copy(interiorHit.point);
         const piece = this.prefabs.interiorPieceForHit(interiorHit);
         const sub = this.prefabs.interiorVoxelForHit(interiorHit);
         if (piece && sub !== null) this.destruction.damageInterior(piece, damage, sub);
-      } else if (voxelHit) {
+      } else if (voxelHit && voxelDistance < groundDistance) {
         end.copy(voxelHit.point);
         const index = this.prefabs.voxelForHit(voxelHit);
         const piece = this.prefabs.pieceForHit(voxelHit);
         if (index !== null && piece !== null) this.destruction.damageVoxel(index, damage * 0.75, piece);
+      } else if (groundHit) {
+        end.copy(groundHit.point);
+        this.destruction.damageRoadSurface(groundHit.point.x, groundHit.point.z, damage * 0.75);
       }
       this.launchBulletParticle(visualMuzzle, end);
     }

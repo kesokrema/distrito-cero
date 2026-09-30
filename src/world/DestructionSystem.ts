@@ -108,6 +108,13 @@ export class DestructionSystem {
     return true;
   }
 
+  damageRoadSurface(x: number, z: number, amount: number): boolean {
+    const color = this.prefabs.damageRoadSurface(x, z, amount);
+    if (!color) return false;
+    this.spawnDebris(new THREE.Vector3(x, this.grid.groundHeight(x, z) + 0.035, z), color);
+    return true;
+  }
+
   blast(x: number, z: number, radius = 4.1, source: 'player' | 'enemy' = 'player', y = 0.9): number {
     if (y - this.grid.groundHeight(x, z) < 2.2) this.prefabs.scorchGround(x, z, radius * 0.8);
     const changed = new Set<number>();

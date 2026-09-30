@@ -51,6 +51,7 @@ export class NPCController {
   private simulationTime = 0;
   private lastDanger = new THREE.Vector3();
   private blastCount = 0;
+  private reactionSequence = 0;
   private leaderLost = false;
   private nextNpcId = 0;
   private populatedBlocks = new Set<string>();
@@ -128,6 +129,7 @@ export class NPCController {
       // Player weapons emit this event. Keep the actual shooter as the danger
       // source even when the muzzle sits off-center or the player is moving.
       const sourceX = this.player.position.x, sourceZ = this.player.position.z;
+      this.reactionSequence++;
       this.lastDanger.set(sourceX, 0, sourceZ);
       for (const npc of this.npcs) {
         if (!npc.alive) continue;
@@ -135,8 +137,11 @@ export class NPCController {
         if (distance > radius) continue;
         if (npc.kind === 'civilian') {
           if (npc.state === 'flee' || npc.state === 'hide' || npc.panic >= 0.15) continue;
+          const courage = this.grid.hash(npc.id, 918, 55);
+          const startle = this.grid.hash(npc.id, this.reactionSequence, 911);
           npc.state = 'flee'; npc.panic = Math.max(npc.panic, 0.38 + (1 - distance / radius) * 0.4);
-          npc.fearTime = 0.8;
+          // Different people freeze for different lengths of time before they run.
+          npc.fearTime = startle < 0.24 ? 1.05 + courage * 0.45 : 0.32 + courage * 0.42;
           this.flee(npc, sourceX, sourceZ, true, true);
         } else if (npc.state !== 'surrender') npc.state = 'chase';
       }
@@ -630,7 +635,8 @@ export class NPCController {
       const progress = travelX * away.x + travelZ * away.y;
       const distanceGain = Math.hypot(wx - x, wz - z) - Math.hypot(npc.group.position.x - x, npc.group.position.z - z);
       const cover = [[1, 0], [-1, 0], [0, 1], [0, -1]].some(([cx, cz]) => this.grid.cell(cell.x + cx, cell.z + cz)?.blocked);
-      const score = progress * 1.25 + distanceGain * 0.35 - travel * 0.18 + (cover ? 3 : 0) + this.grid.hash(cell.x, cell.z, npc.id) * 0.4;
+      const caution = this.grid.hash(npc.id, 918, 55);
+      const score = progress * 1.25 + distanceGain * 0.35 - travel * 0.18 + (cover ? 1.8 + caution * 3.1 : 0) + this.grid.hash(cell.x, cell.z, npc.id) * 0.4;
       if (score > fallbackScore) { fallbackScore = score; fallback = cell; }
       if (progress < Math.max(this.grid.cellSize * 0.3, travel * 0.12)) continue;
       if (score > bestScore) { bestScore = score; best = cell; sheltered = cover; }
@@ -1002,6 +1008,16 @@ export class NPCController {
         const heading = Math.atan2(delta.x, delta.z);
         const turn = Math.atan2(Math.sin(heading - npc.group.rotation.y), Math.cos(heading - npc.group.rotation.y));
         npc.group.rotation.y += turn * Math.min(1, dt * 4);
+      } else {
+        // A resting pedestrian occasionally scans the street; each one has a
+        // stable curiosity level and a different glance timing and direction.
+        const lookPhase = (this.simulationTime + npc.id * 2.173) % 13.5;
+        const curiosity = this.grid.hash(npc.id, 441, 23);
+        if (lookPhase > 5.3 && lookPhase < 8.1 && curiosity > 0.26) {
+          const glance = (curiosity - 0.5) * 1.5;
+          const turn = Math.atan2(Math.sin(glance - npc.group.rotation.y), Math.cos(glance - npc.group.rotation.y));
+          npc.group.rotation.y += turn * Math.min(1, dt * 1.7);
+        }
       }
       this.animate(npc, rig, dt, false, Boolean(partner));
       return;
@@ -1019,7 +1035,8 @@ export class NPCController {
       else npc.pathIndex++;
       if (npc.kind === 'civilian' && npc.pathIndex >= npc.path.length) {
         if (npc.state === 'flee' && npc.hideTarget === npc.target) {
-          npc.state = 'hide'; npc.hideTime = 2.5 + this.grid.hash(npc.id, Math.floor(this.simulationTime), 613) * 2.5;
+          const caution = this.grid.hash(npc.id, 918, 55);
+          npc.state = 'hide'; npc.hideTime = 1.8 + caution * 4.2 + this.grid.hash(npc.id, Math.floor(this.simulationTime), 613) * 1.2;
           npc.hideTarget = undefined;
           npc.path = []; npc.pathIndex = 0;
           npc.velocity?.set(0, 0, 0);
@@ -1191,6 +1208,11 @@ export class NPCController {
     const frightened = (npc.fearTime || 0) > 0.15;
     const surrendering = npc.state === 'surrender';
     const combat = npc.kind === 'enemy' && !surrendering && (npc.state === 'chase' || npc.state === 'cover' || npc.state === 'flank');
+    const idlePhase = (this.simulationTime + npc.id * 2.173) % 22;
+    const phoneSide = this.grid.hash(npc.id, 712, 17) > 0.5 ? 1 : 0;
+    const phoneUse = !moving && !fleeing && !hiding && !frightened && !combat && !surrendering &&
+      npc.kind === 'civilian' && npc.pauseTime > 1 && idlePhase > 14 && idlePhase < 18 &&
+      this.grid.hash(npc.id, 311, 42) > 0.48;
     setFaceExpression(rig.face, frightened || fleeing || surrendering ? 'scared' :
       combat || npc.warned ? 'annoyed' : talking || (npc.kind === 'civilian' && npc.pauseTime > 2 && npc.panic < 0.2) ? 'happy' : 'normal');
     const speed = moving ? Math.max(npc.velocity?.length() || 0, npc.indoorAnchor ? npc.speed * 0.45 : 0) : 0;
@@ -1205,7 +1227,7 @@ export class NPCController {
     // poses such as idle, fear, aim, and crouch.
     const proceduralGait = requested === 'walk' || requested === 'run';
     if (proceduralGait) this.mixamo.stop(rig.body);
-    if (!proceduralGait && this.mixamo.update(rig.body, dt, requested)) {
+    if (!proceduralGait && !phoneUse && this.mixamo.update(rig.body, dt, requested)) {
       if (combat || (npc.fireTime || 0) > 0.03) this.poseRifleGrip(rig, dt);
       rig.phase += speed * dt * (fleeing ? 5.2 : 4.5);
       rig.bubble.visible = talking && !frightened;
@@ -1261,6 +1283,10 @@ export class NPCController {
       } else if (talking) {
         shoulderX = side === 0 ? -0.4 + Math.sin(this.simulationTime * 3 + npc.id) * 0.22 : 0;
         elbowX = -0.35;
+      } else if (phoneUse) {
+        shoulderX = side === phoneSide ? -1.08 : -0.04;
+        shoulderZ = side === phoneSide ? (phoneSide === 0 ? -0.12 : 0.12) : 0;
+        elbowX = side === phoneSide ? -0.92 : 0.08;
       }
       if (!(rig.heavy && combat)) {
         this.springPose(rig, shoulder, 'x', shoulderX + (npc.fireTime && side === 1 ? 0.32 : 0), dt, 14);
@@ -1276,6 +1302,7 @@ export class NPCController {
     this.springPose(rig, rig.torso, 'z', -turn * 0.14, dt, 11);
     rig.torso.position.y += ((hiding ? -0.21 : 0.16 - Math.abs(Math.sin(rig.phase)) * 0.035 * rig.motion) - rig.torso.position.y) * (1 - Math.exp(-dt * 10));
     this.springPose(rig, rig.head, 'x', hiding ? 0.24 : frightened ? -0.18 : 0, dt, 9);
+    this.springPose(rig, rig.head, 'z', phoneUse ? (phoneSide === 0 ? -0.12 : 0.12) : 0, dt, 8);
     rig.bubble.visible = talking && !frightened;
     if (rig.flash) {
       rig.flash.visible = (npc.fireTime || 0) > 0;

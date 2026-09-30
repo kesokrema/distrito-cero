@@ -172,7 +172,8 @@ export class VehicleSystem {
   private hitPedestrians(car: THREE.Group, playerPosition: THREE.Vector3): void {
     const specs = car.userData.vehicle as { length: number; width: number; impact: number };
     const forwardX = Math.sin(car.rotation.y), forwardZ = Math.cos(car.rotation.y);
-    if (this.playerImpactCooldown === 0 && Math.abs(playerPosition.y-car.position.y) < 0.8 && car.position.distanceToSquared(playerPosition) < (specs.length / 2 + 0.7) ** 2) {
+    const playerReach = Math.hypot(specs.length / 2, specs.width / 2) + 0.5;
+    if (this.playerImpactCooldown === 0 && Math.abs(playerPosition.y-car.position.y) < 0.8 && car.position.distanceToSquared(playerPosition) < playerReach ** 2) {
       const dx = playerPosition.x - car.position.x, dz = playerPosition.z - car.position.z;
       const along = dx * forwardX + dz * forwardZ;
       const across = dx * forwardZ - dz * forwardX;
@@ -351,8 +352,10 @@ export class VehicleSystem {
         this.events.emit('alert', { text: 'COLISIÓN ENTRE VEHÍCULOS', tone: 'danger' });
         this.crashCooldown = 1.2;
       }
-      if (!vehicleAhead && Math.abs(this.speed) > 4 && this.crashCooldown === 0) {
-        this.events.emit('alert', { text: 'CHOQUE · VEHÍCULO DETENIDO', tone: 'danger' });
+      if (!vehicleAhead && Math.abs(this.speed) > 2.4 && this.crashCooldown === 0) {
+        const impactDirection = new THREE.Vector3(Math.sin(car.rotation.y), 0, Math.cos(car.rotation.y)).multiplyScalar(Math.sign(driveSpeed));
+        this.destruction.damageVehicleImpact(car, impactDirection, impactSpeed);
+        this.events.emit('alert', { text: 'CHOQUE · CARROCERÍA DAÑADA', tone: 'danger' });
         this.crashCooldown = 1.2;
       }
       this.speed *= -0.08;
@@ -395,7 +398,7 @@ export class VehicleSystem {
     for (const along of [-halfLength, halfLength]) samples.push([along, 0]);
     for (const across of [-halfWidth, halfWidth]) samples.push([0, across]);
     const centerHeight=this.grid.groundHeight(x,z);
-    return samples.every(([along, across]) => {
+    const clearCells = samples.every(([along, across]) => {
       const wx=x + forwardX * along + sideX * across,wz=z + forwardZ * along + sideZ * across;
       if(Math.abs(this.grid.groundHeight(wx,wz)-centerHeight)>.7+Math.abs(along)*.35)return false;
       const cell = this.grid.cellAtWorld(wx,wz);
@@ -403,6 +406,9 @@ export class VehicleSystem {
       // reservation must not block the adjacent open driving lane.
       return !!cell?.active && !cell.rubble && (!cell.blocked || cell.tile === 'road');
     });
+    if (!clearCells) return false;
+    const prefabSpace = this.prefabs.vehicleSpaceClear;
+    return typeof prefabSpace !== 'function' || prefabSpace.call(this.prefabs, x, z, yaw, specs.length, specs.width, centerHeight);
   }
 
   private nearest(position: THREE.Vector3): THREE.Group | null {
