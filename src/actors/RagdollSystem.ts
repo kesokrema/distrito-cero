@@ -456,7 +456,7 @@ export class RagdollSystem {
       Number(!body.missing.has('rightUpperArm') && !body.missing.has('rightForearm'));
     const bothLegs = (body.missing.has('leftThigh') || body.missing.has('leftShin')) &&
       (body.missing.has('rightThigh') || body.missing.has('rightShin'));
-    const speed = (bothLegs ? 0.56 : 0.82) * (intactArms === 2 ? 1 : intactArms === 1 ? 0.55 : 0.12);
+    const speed = (bothLegs ? 0.12 : 0.2) * (intactArms === 2 ? 1 : intactArms === 1 ? 0.55 : 0.12);
     const distance = speed * step;
     const right = new THREE.Vector3(direction.z, 0, -direction.x);
     // Sweep the whole prone silhouette, including the front of the head.

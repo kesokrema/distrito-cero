@@ -11,7 +11,8 @@ import { DestructionSystem } from '../world/DestructionSystem';
 export type DriveInput = { forward: boolean; reverse: boolean; left: boolean; right: boolean; handbrake: boolean };
 type TrafficTurn = { axis: 'x' | 'z'; direction: number; progress: number; radius: number; start: THREE.Vector2; control: THREE.Vector2; end: THREE.Vector2 };
 type TrafficState = { axis: 'x' | 'z'; direction: number; speed: number; cruiseSpeed: number; seed: number;
-  turn: TrafficTurn | null; panicTime: number; danger: THREE.Vector2 | null; blockedTime: number; };
+  turn: TrafficTurn | null; panicTime: number; danger: THREE.Vector2 | null; blockedTime: number;
+  bypassLane?: number; passingVehicle?: THREE.Group; };
 type ImpactMotion = { velocity: THREE.Vector2; parkWhenSettled: boolean };
 
 function overlapsVehicle(a: { x: number; z: number; y:number; yaw: number; length: number; width: number }, b: THREE.Group): boolean {
@@ -91,8 +92,8 @@ export class VehicleSystem {
       state.panicTime = Math.max(0, state.panicTime - dt);
       const specs = car.userData.vehicle as { maxSpeed: number };
       const fleeingSpeed = Math.min(specs.maxSpeed * 0.85, state.cruiseSpeed * 1.85);
-      state.speed = THREE.MathUtils.lerp(state.speed, state.blockedTime > 0 ? 0 : state.panicTime > 0 ? fleeingSpeed : state.cruiseSpeed,
-        Math.min(1, dt * (state.blockedTime > 0 ? 6 : state.panicTime > 0 ? 3 : 1.2)));
+      state.speed = THREE.MathUtils.lerp(state.speed, state.blockedTime > 0 && state.bypassLane===undefined ? 0 : state.panicTime > 0 ? fleeingSpeed : state.cruiseSpeed,
+        Math.min(1, dt * (state.blockedTime > 0 && state.bypassLane===undefined ? 6 : state.panicTime > 0 ? 3 : 1.2)));
       if (!state.turn) state.turn = this.planTurn(car, state, dt);
       if (state.turn) {
         const turn = state.turn;
@@ -128,11 +129,56 @@ export class VehicleSystem {
       const nextCell = this.grid.cellAtWorld(nextX, nextZ);
       const carSpecs = car.userData.vehicle as { length: number; width: number };
       const target = state.axis === 'x' ? state.direction * Math.PI / 2 : state.direction > 0 ? 0 : Math.PI;
+      const roadIndex=this.grid.grid(car.position.x,car.position.z)[state.axis==='x'?1:0];
+      const originalLane=this.grid.roadLane(state.axis,roadIndex,state.direction);
+      const cross=state.axis==='x'?car.position.z:car.position.x;
+      if(state.bypassLane!==undefined&&state.passingVehicle){
+        const forward=state.axis==='x'?state.direction*(state.passingVehicle.position.x-car.position.x):state.direction*(state.passingVehicle.position.z-car.position.z);
+        const otherSpecs=state.passingVehicle.userData.vehicle as {length:number};
+        const ownSpecs=car.userData.vehicle as {length:number};
+        if(state.passingVehicle.userData.destroyed||forward<-(ownSpecs.length+otherSpecs.length)/2-2){state.bypassLane=originalLane;state.passingVehicle=undefined;}
+      } else if(state.bypassLane!==undefined){
+        if(Math.abs(cross-originalLane)<.12)state.bypassLane=undefined;
+      }
+      const targetLane=state.bypassLane??originalLane;
+      if(state.bypassLane===undefined&&!state.turn){
+        const blocker=this.vehicleSpatial.nearby(car.position.x,car.position.z,25).find(other=>{
+          if(other===car||other.userData.destroyed||Math.abs(other.position.y-car.position.y)>1.4)return false;
+          const otherSpecs=other.userData.vehicle as {length:number;width:number}|undefined;if(!otherSpecs)return false;
+          const fx=state.axis==='x'?state.direction:0,fz=state.axis==='z'?state.direction:0;
+          const ahead=(other.position.x-car.position.x)*fx+(other.position.z-car.position.z)*fz;
+          const across=state.axis==='x'?Math.abs(other.position.z-originalLane):Math.abs(other.position.x-originalLane);
+          const gap=ahead-(carSpecs.length+otherSpecs.length)/2;
+          if(gap<0||gap>18||across>(carSpecs.width+otherSpecs.width)/2+.45)return false;
+          const lead=other.userData.autonomous===true?this.traffic.get(other):undefined;
+          return other.userData.autonomous!==true||Boolean(lead&&lead.speed<.8&&lead.blockedTime>.6);
+        });
+        if(blocker){
+          const adjacent=this.grid.roadLane(state.axis,roadIndex,-state.direction),offset=adjacent-originalLane;
+          const clear=Array.from({length:5},(_,i)=>(i+1)/5).every(t=>{
+            const x=state.axis==='x'?car.position.x:car.position.x+offset*t;
+            const z=state.axis==='x'?car.position.z+offset*t:car.position.z;
+            for(const lead of [0,6,12,18]){
+              const px=x+(state.axis==='x'?state.direction*lead:0),pz=z+(state.axis==='z'?state.direction*lead:0);
+              const cell=this.grid.cellAtWorld(px,pz);
+              if(!cell?.active||cell.tile!=='road'||cell.rubble||!this.vehicleFits(car,px,pz,target))return false;
+              if(this.vehicleSpatial.nearby(px,pz,12).some(other=>other!==car&&
+                overlapsVehicle({x:px,z:pz,y:car.position.y,yaw:target,length:carSpecs.length,width:carSpecs.width},other)))return false;
+            }
+            return true;
+          });
+          if(clear){state.bypassLane=adjacent;state.passingVehicle=blocker;state.blockedTime=0;}
+        }
+      }
+      const crossStep=THREE.MathUtils.clamp(targetLane-cross,-Math.max(.1,dt*4),Math.max(.1,dt*4));
+      const laneX=state.axis==='z'?car.position.x+crossStep:nextX;
+      const laneZ=state.axis==='x'?car.position.z+crossStep:nextZ;
       const obstacle = this.vehicleSpatial.nearby(car.position.x, car.position.z, 8).some((other) =>
-        other !== car && overlapsVehicle({ x: nextX, z: nextZ, y:car.position.y, yaw: target, length: carSpecs.length, width: carSpecs.width }, other));
-      const moved = !!(nextCell?.active && nextCell.tile === 'road' && !nextCell.rubble && this.vehicleFits(car, nextX, nextZ, target) && !obstacle);
+        other !== car && overlapsVehicle({ x: laneX, z: laneZ, y:car.position.y, yaw: target, length: carSpecs.length, width: carSpecs.width }, other));
+      const nextLaneCell=this.grid.cellAtWorld(laneX,laneZ);
+      const moved = !!(nextLaneCell?.active && nextLaneCell.tile === 'road' && !nextLaneCell.rubble && this.vehicleFits(car, laneX, laneZ, target) && !obstacle);
       if (moved) {
-        car.position.set(nextX, car.position.y, nextZ);
+        car.position.set(laneX, car.position.y, laneZ);
         state.blockedTime = 0;
       } else {
         state.blockedTime += dt;

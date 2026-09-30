@@ -41,6 +41,7 @@ export type NPC = {
   velocity?: THREE.Vector3; fireTime?: number; groundPhysics?:GroundPhysics;
   blockedMoveTime?: number;
   detourCell?: number;
+  hitReaction?: { age: number; duration: number; fatal: boolean; direction: THREE.Vector3 };
 };
 
 export class NPCController {
@@ -214,7 +215,7 @@ export class NPCController {
   }
 
   damage(npc: NPC, amount: number, part: BodyPart = 'torso', point?: THREE.Vector3, limbTrauma = amount): boolean {
-    if (!npc.alive) return false;
+    if (!npc.alive || npc.pendingDeath) return npc.pendingDeath;
     const healthScale = part === 'head' ? 4.5 : part === 'torso' ? 1 : 0.75;
     npc.stamina -= amount * healthScale;
     npc.state = npc.kind === 'enemy' ?
@@ -222,12 +223,19 @@ export class NPCController {
     npc.fearTime = Math.max(npc.fearTime || 0, 0.45);
     if (npc.kind === 'civilian') { npc.panic = Math.max(npc.panic, 0.85); this.flee(npc, this.player.position.x, this.player.position.z); }
     const impulse = (point || npc.group.position).clone().sub(this.player.position).setY(1.6).normalize().multiplyScalar(3.1 + amount);
-    if (!npc.ragdoll) {
+    if (part === 'head' && !npc.ragdoll) {
       npc.ragdoll = this.ragdolls.spawn(npc.group.position, npc.group.rotation.y, impulse,
         npc.group.userData.ragdollColors, Math.round((npc.group.position.y-this.grid.terrain.height(npc.group.position.x,npc.group.position.z))/FLOOR_HEIGHT), 1, 25, npc.missing, this.ragdollPose(npc));
       npc.group.visible = false;
       npc.marker.visible = false;
-    } else this.ragdolls.impact(npc.ragdoll, point || npc.ragdoll.joints[2].position, impulse);
+    } else if (npc.ragdoll) this.ragdolls.impact(npc.ragdoll, point || npc.ragdoll.joints[2].position, impulse);
+    else {
+      const fatal = npc.stamina <= 0;
+      npc.pendingDeath = fatal;
+      npc.hitReaction = { age: 0, duration: fatal ? 4.6 : 1.8, fatal, direction: impulse.clone().setY(0).normalize() };
+      npc.knockdownTime = fatal ? Infinity : 1.8;
+      npc.velocity?.set(0, 0, 0);
+    }
     npc.knockdownTime = Math.max(npc.knockdownTime, 1.55 + Math.min(0.8, amount * 0.28));
     npc.path = [];
     if (part !== 'head' && part !== 'torso') {
@@ -236,8 +244,16 @@ export class NPCController {
       const rig = npc.group.userData.rig as CharacterRig;
       const mesh = rig.parts[part];
       if (mesh) mesh.material = this.woundMaterial;
-      this.ragdolls.wound(npc.ragdoll, part);
       if (wounds[part]! >= 2.2 && !(npc.missing ||= new Set()).has(part)) {
+        if (!npc.ragdoll) {
+          npc.ragdoll = this.ragdolls.spawn(npc.group.position, npc.group.rotation.y, impulse,
+            npc.group.userData.ragdollColors, Math.round((npc.group.position.y-this.grid.terrain.height(npc.group.position.x,npc.group.position.z))/FLOOR_HEIGHT),
+            1, 25, npc.missing, this.ragdollPose(npc));
+          npc.group.visible = false;
+          npc.marker.visible = false;
+          npc.hitReaction = undefined;
+        }
+        this.ragdolls.wound(npc.ragdoll, part);
         npc.missing.add(part);
         if (part.endsWith('UpperArm')) npc.missing.add(part.replace('UpperArm', 'Forearm') as BodyPart);
         if (part.endsWith('Thigh')) npc.missing.add(part.replace('Thigh', 'Shin') as BodyPart);
@@ -263,7 +279,10 @@ export class NPCController {
         }
       }
     }
-    if (npc.stamina <= 0) { this.remove(npc); return true; }
+    if (npc.stamina <= 0) {
+      if (npc.ragdoll) this.remove(npc);
+      return true;
+    }
     return false;
   }
 
@@ -359,7 +378,7 @@ export class NPCController {
     if (npc.bleedOutTime === undefined) return;
     npc.bleedOutTime = Math.max(0, npc.bleedOutTime - dt);
     npc.stamina -= dt * (this.hasLostLeg(npc) ? 0.13 : 0.09);
-    if (npc.bleedOutTime === 0 || npc.stamina <= 0) { this.remove(npc); return; }
+    if (npc.bleedOutTime === 0 || npc.stamina <= 0 && !npc.hitReaction?.fatal) { this.remove(npc); return; }
     npc.bleedFxClock = (npc.bleedFxClock || 0) + dt;
     if (npc.bleedFxClock >= 0.26) {
       npc.bleedFxClock %= 0.26;
@@ -652,10 +671,10 @@ export class NPCController {
     this.route(npc, goal, { x: sourceX, z: sourceZ, radius: 12 });
   }
 
-  private remove(npc: NPC, impulse?: THREE.Vector3): void {
+  private remove(npc: NPC, impulse?: THREE.Vector3, createRagdoll = true): void {
     if (!npc.alive) return;
     if (npc.ragdoll) { npc.ragdoll.crawling = false; npc.ragdoll.life = npc.ragdoll.age + 20; }
-    else {
+    else if (createRagdoll) {
       const outward = impulse || new THREE.Vector3(npc.group.position.x - this.player.position.x, 1.1, npc.group.position.z - this.player.position.z).normalize().multiplyScalar(2.1);
       npc.ragdoll = this.ragdolls.spawn(npc.group.position, npc.group.rotation.y, outward,
         npc.group.userData.ragdollColors, Math.round((npc.group.position.y-this.grid.terrain.height(npc.group.position.x,npc.group.position.z))/FLOOR_HEIGHT), 1, 20, npc.missing, this.ragdollPose(npc));
@@ -676,7 +695,7 @@ export class NPCController {
       dx: direction.x * Math.min(3, force), dy: 1.3, dz: direction.z * Math.min(3, force),
       count: THREE.MathUtils.clamp(Math.round(force * 5), 7, 22), floor: npc.group.position.y });
     npc.pendingDeath = npc.stamina <= 0;
-    npc.knockdownTime = 1.5;
+    npc.knockdownTime = npc.pendingDeath ? Infinity : 1.8;
     npc.knockback.copy(direction).multiplyScalar(5.5);
     npc.path = [];
     npc.pauseTime = 0;
@@ -693,13 +712,32 @@ export class NPCController {
         }
       }
     } else npc.state = 'chase';
-    if (npc.pendingDeath) this.remove(npc, npc.knockback.clone().setY(2.8));
-    else {
-      npc.ragdoll = this.ragdolls.spawn(npc.group.position, npc.group.rotation.y, npc.knockback.clone().setY(2.8),
-        npc.group.userData.ragdollColors, Math.round((npc.group.position.y-this.grid.terrain.height(npc.group.position.x,npc.group.position.z))/FLOOR_HEIGHT), 1, 3, npc.missing, this.ragdollPose(npc));
-      npc.group.visible = false;
-      npc.marker.visible = false;
+    npc.hitReaction={age:0,duration:npc.pendingDeath?4.6:1.8,fatal:npc.pendingDeath,direction:direction.clone()};
+    npc.velocity?.set(0,0,0);npc.marker.visible=false;
+  }
+
+  /** Articulated fall for body hits, followed by a short pain pose if fatal. */
+  private poseGroundHit(npc:NPC):void {
+    const reaction=npc.hitReaction!,rig=npc.group.userData.rig as CharacterRig;
+    this.mixamo.stop(rig.body);
+    npc.marker.visible=false;
+    const fall=Math.min(1,reaction.age/.46),ease=fall*fall*(3-2*fall);
+    const breath=reaction.fatal&&reaction.age>0.48&&reaction.age<3.65?Math.sin(reaction.age*3.1)*.035:0;
+    rig.body.rotation.set(breath,0,Math.sin(reaction.age*1.7)*.018);
+    rig.hips.position.y=1.32-.84*ease;
+    rig.hips.rotation.x=.08*ease;
+    rig.torso.rotation.set(1.38*ease+breath,0,reaction.direction.x*.08*ease);
+    rig.head.rotation.set(-.12*ease,0,0);
+    for(let side=0;side<2;side++) {
+      const sign=side===0?-1:1,phase=reaction.age*5.3+side*Math.PI;
+      const brace=reaction.age<.5?Math.sin(reaction.age*11+side)*.18:0;
+      rig.arms[side].rotation.set(-.65*ease+brace+breath*sign,0,sign*(.35+.42*ease));
+      rig.elbows[side].rotation.set(-.86*ease+Math.max(0,Math.sin(phase))*.12*ease,0,0);
+      rig.legs[side].rotation.set(-1.3*ease+Math.sin(phase)*.045*ease,0,sign*.035*ease);
+      rig.knees[side].rotation.set(1.2*ease+Math.max(0,Math.sin(phase))*.12*ease,0,0);
+      rig.feet[side].rotation.set(-.25*ease,0,0);
     }
+    if(reaction.fatal&&reaction.age>1.15)setFaceExpression(rig.face,'dead');
   }
 
   update(dt: number): void {
@@ -729,6 +767,24 @@ export class NPCController {
       }
       this.updateBleeding(npc, dt);
       if (!npc.alive) continue;
+      if (npc.hitReaction) {
+        const reaction=npc.hitReaction;
+        reaction.age+=dt;
+        this.poseGroundHit(npc);
+        if(reaction.fatal) {
+          if(reaction.age>=reaction.duration){npc.hitReaction=undefined;this.remove(npc,undefined,false);}
+        } else if(reaction.age>=reaction.duration) {
+          npc.hitReaction=undefined;npc.knockdownTime=0;npc.marker.visible=npc.kind==='enemy';
+          const rig=npc.group.userData.rig as CharacterRig;
+          rig.body.rotation.set(0,0,0);rig.hips.position.y=1.32;rig.hips.rotation.set(0,0,0);
+          rig.torso.rotation.set(0,0,0);rig.head.rotation.set(0,0,0);
+          rig.arms.forEach(j=>j.rotation.set(0,0,0));rig.elbows.forEach(j=>j.rotation.set(0,0,0));
+          rig.legs.forEach(j=>j.rotation.set(0,0,0));rig.knees.forEach(j=>j.rotation.set(0,0,0));rig.feet.forEach(j=>j.rotation.set(0,0,0));
+          rig.springs.clear();npc.groundPhysics?.reset();npc.velocity?.set(0,0,0);
+          if(npc.kind==='civilian')this.flee(npc,this.lastDanger.x,this.lastDanger.z);
+        }
+        continue;
+      }
       if (npc.ragdoll) {
         if (!this.ragdolls.active(npc.ragdoll)) { this.remove(npc); continue; }
         if (this.hasLostLeg(npc)) {
@@ -1067,7 +1123,17 @@ export class NPCController {
     const step = Math.min(direction.length() + 0.1, npc.velocity.length() * dt);
     const lateral = new THREE.Vector3(-direction.z, 0, direction.x);
     const preference = npc.id % 2 ? 1 : -1;
-    const options = [npc.velocity.clone().normalize(), direction, direction.clone().addScaledVector(lateral, preference * 1.15).normalize(), direction.clone().addScaledVector(lateral, -preference * 1.15).normalize()];
+    const crowd=this.spatial.nearby(npc.group.position.x,npc.group.position.z,2).filter(other=>other!==npc&&other.alive&&
+      Math.abs(other.group.position.y-npc.group.position.y)<1&&other.knockdownTime<=0);
+    const avoid=new THREE.Vector3();
+    for(const other of crowd){const away=new THREE.Vector3(npc.group.position.x-other.group.position.x,0,npc.group.position.z-other.group.position.z),gap=away.length();
+      if(gap<1.35){if(gap<.001)away.copy(lateral).multiplyScalar(other.id<npc.id?1:-1);else away.multiplyScalar(1/gap);avoid.addScaledVector(away,(1.35-gap)/1.35);}}
+    // Give each pedestrian a stable passing side and a reciprocal push before
+    // the body capsules touch; dense pairs no longer stop face-to-face.
+    const dodge=avoid.multiplyScalar(1.7).addScaledVector(lateral,preference*.42);
+    const options = [direction.clone().add(dodge).normalize(), npc.velocity.clone().normalize(), direction,
+      direction.clone().addScaledVector(lateral, preference * 1.15).normalize(),
+      direction.clone().addScaledVector(lateral, -preference * 1.15).normalize()];
     let moved = false;
     let heading = Math.atan2(direction.x, direction.z);
     for (const vector of options) {
@@ -1123,7 +1189,12 @@ export class NPCController {
       Math.hypot(this.player.position.x - x, this.player.position.z - z) < 1.02) return false;
     for (const other of this.spatial.nearby(x, z, 1.5)) {
       if (other === npc || !other.alive || Math.abs(other.group.position.y - npc.group.position.y) > 1) continue;
-      if (Math.hypot(other.group.position.x - x, other.group.position.z - z) < (other.knockdownTime > 0 ? 0.82 : 1.04)) return false;
+      const dx=x-other.group.position.x,dz=z-other.group.position.z;
+      if(other.hitReaction&&!other.hitReaction.fatal){
+        const fx=Math.sin(other.group.rotation.y),fz=Math.cos(other.group.rotation.y);
+        const along=Math.abs(dx*fx+dz*fz),across=Math.abs(dx*fz-dz*fx);
+        if(along<1.02&&across<.58)return false;
+      } else if (Math.hypot(dx,dz) < (other.knockdownTime > 0 ? 0.76 : 0.78)) return false;
     }
     // Pedestrians yield to parked, driven, and autonomous traffic using the
     // actual oriented vehicle footprint, rather than checking only its center.
