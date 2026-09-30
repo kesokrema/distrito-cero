@@ -244,6 +244,7 @@ export class NPCController {
       const rig = npc.group.userData.rig as CharacterRig;
       const mesh = rig.parts[part];
       if (mesh) mesh.material = this.woundMaterial;
+      if (npc.ragdoll) this.ragdolls.wound(npc.ragdoll, part);
       if (wounds[part]! >= 2.2 && !(npc.missing ||= new Set()).has(part)) {
         if (!npc.ragdoll) {
           npc.ragdoll = this.ragdolls.spawn(npc.group.position, npc.group.rotation.y, impulse,
@@ -253,7 +254,6 @@ export class NPCController {
           npc.marker.visible = false;
           npc.hitReaction = undefined;
         }
-        this.ragdolls.wound(npc.ragdoll, part);
         npc.missing.add(part);
         if (part.endsWith('UpperArm')) npc.missing.add(part.replace('UpperArm', 'Forearm') as BodyPart);
         if (part.endsWith('Thigh')) npc.missing.add(part.replace('Thigh', 'Shin') as BodyPart);
