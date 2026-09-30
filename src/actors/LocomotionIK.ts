@@ -121,7 +121,7 @@ export class LocomotionIK {
     if(this.interiorObstacleAt?.(x,z,Math.max(this.group.position.y,support.height))||this.actorCollision?.(x,z))return false;
     // Leaving a roof or bridge is a fall, even when the cell below is water
     // or an otherwise unwalkable parcel. Obstacles still stop the body.
-    return support.deck || this.grid.walkable(x,z) || this.interiorWalkable?.(x,z)===true ||
+    return support.deck || this.grid.walkable(x,z) || this.grid.water.at(x,z) || this.interiorWalkable?.(x,z)===true ||
       support.height < this.group.position.y-.52;
   }
 

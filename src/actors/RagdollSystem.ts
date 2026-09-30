@@ -5,6 +5,7 @@ import { CANAL_SURFACE_Y } from '../world/CanalWater';
 import { voxelShape } from '../world/VoxelSystem';
 import type { BodyPart } from './HumanoidModel';
 import { createFaceDecal, setFaceExpression, type FaceExpression } from './FaceTextures';
+import { sampleJointMotion, type JointMotion } from './JointAnimation';
 
 type Joint = { position: THREE.Vector3; previous: THREE.Vector3 };
 type Link = { a: number; b: number; length: number; mesh: THREE.Mesh; part: BodyPart; baseMaterial: THREE.Material };
@@ -63,6 +64,9 @@ export class RagdollSystem {
   private looseParts: LoosePart[] = [];
   private readonly woundMaterial = new THREE.MeshStandardMaterial({ color: '#df4543', roughness: 0.82 });
   private readonly waterCurrent = new THREE.Vector3();
+  private crawlMotion?: JointMotion;
+  private readonly motionPoint = new THREE.Vector3();
+  get crawlAnimationSource(): string { return this.crawlMotion?.source ?? 'procedural (loading)'; }
 
   private vehicleAt(x: number, z: number, floor: number, vehicles: readonly THREE.Group[]): boolean {
     for (const vehicle of vehicles) {
@@ -83,7 +87,16 @@ export class RagdollSystem {
       !this.prefabs.interiorObstacleAt(x, z, floor - 0.18) && !this.vehicleAt(x, z, floor, vehicles);
   }
 
-  constructor(private scene: THREE.Scene, private grid: GridSystem, private prefabs: PrefabManager) {}
+  constructor(private scene: THREE.Scene, private grid: GridSystem, private prefabs: PrefabManager) {
+    if (typeof window !== 'undefined') {
+      const base = typeof import.meta.env === 'undefined' ? '/' : import.meta.env.BASE_URL;
+      void fetch(`${base}animations/mixamo/crawl-motion.json`).then(response => {
+        if (!response.ok) throw new Error(`Crawl animation: HTTP ${response.status}`);
+        return response.json();
+      }).then((motion: JointMotion) => { this.crawlMotion = motion; })
+        .catch(error => console.warn('[Crawl] No se pudo cargar Crawling.fbx convertido', error));
+    }
+  }
 
   spawn(position: THREE.Vector3, yaw: number, impulse: THREE.Vector3, colors: Colors, floorLevel = 0, size = 1, life = 20,
     missing: ReadonlySet<BodyPart> = new Set(), initialPose?: readonly THREE.Vector3[]): RagdollBody {
@@ -462,6 +475,18 @@ export class RagdollSystem {
     // Let gravity and the joint solver finish the fall, then guide the trunk
     // into a low prone silhouette. Hands reach alternately and drag the torso.
     const anchor = body.joints[0].position;
+    if (this.crawlMotion) {
+      const anchorX = anchor.x, anchorZ = anchor.z;
+      const blend = 1 - Math.exp(-step * 14);
+      for (let index = 0; index < body.joints.length; index++) {
+        sampleJointMotion(this.crawlMotion, body.crawlAge, index, this.motionPoint).multiplyScalar(body.size);
+        const point = body.joints[index].position;
+        point.x += (anchorX + right.x * this.motionPoint.x + direction.x * this.motionPoint.z - point.x) * blend;
+        point.z += (anchorZ + right.z * this.motionPoint.x + direction.z * this.motionPoint.z - point.z) * blend;
+        point.y += (floor + this.motionPoint.y - point.y) * blend;
+      }
+      return;
+    }
     const settle = Math.min(0.11, step * 5);
     for (const [index, forward, height, lateral] of [[0, 0, 0.32, 0], [1, 0.17, 0.37, 0],
       [2, 0.33, 0.42, 0], [3, 0.68, 0.50, 0], [4, 0.33, 0.46, -0.39],

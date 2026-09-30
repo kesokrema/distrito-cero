@@ -35,6 +35,7 @@ export function meshTerrainSurface(width:number,depth:number,heights:Float32Arra
   const flat=new Float32Array(heights),pieces:Array<{x0:number;x1:number;z0:number;z1:number;offset:number}>=[];
   for(let z=0;z<depth;z++)for(let x=0;x<width;x++) {
     const at=x+z*width,wx=originX+x*size,wz=originZ+z*size;
+    if (!Number.isFinite(heights[at])) { flat[at]=NaN; continue; }
     if(hole(wx+size/2,wz+size/2)){flat[at]=NaN;continue;}
     const intersections=cutouts.filter(c=>c.x0<wx+size-1e-6&&c.x1>wx+1e-6&&c.z0<wz+size-1e-6&&c.z1>wz+1e-6);
     const h=[[wx,wz],[wx,wz+size],[wx+size,wz+size],[wx+size,wz]].map(([a,b])=>elevation(a,b)+heights[at]);

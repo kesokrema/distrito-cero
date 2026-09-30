@@ -5,7 +5,7 @@ import * as THREE from 'three';
 import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
 import { GridSystem } from '../src/world/GridSystem';
 import { PrefabManager } from '../src/world/PrefabManager';
-import { meshVoxelCells } from '../src/world/GreedyMesher';
+import { MERGED_VOXEL_OWNER, meshVoxelCells } from '../src/world/GreedyMesher';
 import { GroundPhysics,stepVehicleSuspension } from '../src/engine/GroundPhysics';
 import { SurfaceNetwork } from '../src/world/SurfaceNetwork';
 import { natureTree } from '../src/world/NaturePrefabs';
@@ -377,12 +377,12 @@ test('decorative voxels snap to one 3D lattice and hide the faces buried between
   const surface = meshVoxelDecorations([first, second]);
   assert.ok(surface);
   assert.ok(surface.quads < 12, 'the internal shared faces must not be rendered');
-  assert.ok(surface.voxelForFace.includes(0) && surface.voxelForFace.includes(1), 'exposed faces must retain their source prop owner');
+  assert.ok(surface.voxelForFace.every(owner=>owner===MERGED_VOXEL_OWNER), 'merged prop quads resolve ownership by voxel coordinates');
   assert.equal(surface.quads * 2, surface.indexes.length / 3);
   second.userData.voxelMask = new Uint8Array(1);
   const masked = meshVoxelDecorations([first, second]);
   assert.ok(masked);
-  assert.ok(masked.voxelForFace.every((owner) => owner === 0), 'resolved voxels cannot reappear in merged decoration geometry');
+  assert.equal(masked.quads,6,'removed neighboring voxels leave only the intact cuboid exterior');
 });
 
 test('roof fixture meshes keep their real sparse voxel footprint and functional catalog', () => {
@@ -526,8 +526,9 @@ test('real chunks retain precise damage, open entrances, floor coverage and boun
   const floorVoxel = world.interiorVoxelForHit(floorHit);
   assert.notEqual(floorVoxel, null);
   world.eraseSceneVoxels(floorPiece, [floorVoxel!]);
-  assert.equal(combinedFloor.parent, null, 'a damaged slab drops its intact combined surface');
-  assert.ok(floorPiece.mesh.visible && !floorPiece.mask[floorVoxel!], 'the original floor remains voxel destructible');
+  world.flushStaticDamage();
+  assert.ok(combinedFloor.parent, 'a damaged floor keeps its compressed render object');
+  assert.ok(!floorPiece.mesh.visible && !floorPiece.mask[floorVoxel!], 'logical voxel damage does not restore source meshes');
   const combinedDetail = detailSurfaces.find((mesh) => {
     const piece = world.interiorPieces.find((item) => item.aggregate?.mesh === mesh);
     return piece && piece.bounds.max.y - piece.bounds.min.y <= S * 2;
@@ -540,8 +541,9 @@ test('real chunks retain precise damage, open entrances, floor coverage and boun
   const detailVoxel = world.interiorVoxelForHit(detailHit);
   assert.notEqual(detailVoxel, null);
   world.eraseSceneVoxels(detailPiece, [detailVoxel!]);
-  assert.equal(combinedDetail.parent, null);
-  assert.ok(detailPiece.mesh.visible && !detailPiece.mask[detailVoxel!]);
+  world.flushStaticDamage();
+  assert.ok(combinedDetail.parent);
+  assert.ok(!detailPiece.mesh.visible && !detailPiece.mask[detailVoxel!]);
   assert.ok(Object.keys(grid.cells).length < grid.size * grid.size / 20);
   // Mobile components follow their vehicle and are excluded before per-piece work when far away.
   const vehicle = world.vehicles.find((item) => item.parent && !item.userData.destroyed)!;
@@ -573,7 +575,10 @@ test('real chunks retain precise damage, open entrances, floor coverage and boun
   assert.equal(collisionDamage.damageRoadSurface(roadX, roadZ, 3), true, 'street surface accepts projectile damage');
   assert.notDeepEqual([...roadPixels.slice(pixelIndex, pixelIndex + 3)], roadPixelBefore,
     'the damaged voxel surface is visibly replaced by a darker exposed layer');
-  assert.equal(grid.groundHeight(roadX, roadZ), roadHeight, 'destroying one road voxel leaves the ground support intact');
+  assert.equal(grid.groundHeight(roadX, roadZ), roadHeight-CITY_VOXEL_SIZE, 'the destroyed road layer reveals a lower solid support');
+  for(let i=0;i<30;i++)world.flushGroundDamage();
+  assert.ok(Array.from(groundChunk!.geometry.getAttribute('position').array).every(Number.isFinite), 'craters never create NaN terrain geometry');
+  assert.ok(groundChunk!.geometry.getAttribute('position').array.some((value,index)=>index%3===1&&Math.abs(value-(roadHeight-CITY_VOXEL_SIZE))<1e-5), 'the road crater has real lower geometry');
   const canalBounds = grid.terrain.canalBounds();
   const canalX = (canalBounds.x0 + canalBounds.x1) / 2;
   const canalZ = grid.world(grid.center, grid.roadZ[4] + 4)[1];
@@ -1071,6 +1076,7 @@ test('crawling bodies stop before furniture, walls and vehicle footprints', () =
   const prefabs = { vehicles: [vehicle], upperFloorPresent: () => false, supportHeight:()=>0, floorHeightAt:(_x:number,_z:number,l:number)=>l*FLOOR_HEIGHT,
     interiorWalkable: () => true, interiorObstacleAt: (x: number, z: number) => x > 2 && x < 3 && Math.abs(z) < 4 } as unknown as PrefabManager;
   const system = new RagdollSystem(scene, grid, prefabs);
+  Object.assign(system, { crawlMotion: JSON.parse(readFileSync('public/animations/mixamo/crawl-motion.json','utf8')) });
   const colors = { shirt: '#557788', pants: '#334455', skin: '#ddb997', shoes: '#223344' };
   const makeCrawler = (z: number) => {
     const body = system.spawn(new THREE.Vector3(0, 0, z), 0, new THREE.Vector3(), colors,
@@ -1230,9 +1236,9 @@ test('landscape access paths stay clear, canal bridges have human clearance and 
       assert.equal(world.interiorObstacleAt(x,z,y),false,`blocked landscape access ${surface.id} at ${t}`);
     }
   }
-  assert.ok(world.interiorPieces.some(p=>p.mesh.name==='voxel-earth-foundation'&&p.mesh.userData.voxelDimensions?.voxelSize===S),
+  assert.ok(scene.getObjectByName('voxel-earth-foundation')?.userData.voxelDimensions?.voxelSize===S,
     'raised and lowered terrain uses voxel foundations');
-  assert.ok(world.interiorPieces.some(p=>p.mesh.name==='canal-water'&&p.mesh.userData.voxelDimensions?.voxelSize===S),
+  assert.ok(scene.getObjectByName('canal-water')?.userData.voxelDimensions?.voxelSize===S,
     'lowered canal water follows the same voxel lattice');
   const canalAccesses=surfaces.filter(s=>s.id.startsWith('riverwalk:')&&s.id.endsWith(':access'));
   for(const access of canalAccesses) {
@@ -1291,6 +1297,9 @@ test('landscape access paths stay clear, canal bridges have human clearance and 
   for(let frame=0;frame<180;frame++)jumper.update(1/60,new THREE.Vector2(0,1),[],false);
   assert.ok(jumper.group.position.z>bridgeEnd+2&&jumper.group.position.y<CANAL_SURFACE_Y,
     'jumping past the bridge edge falls into flowing water');
+  const beforeSwim=jumper.group.position.clone();
+  for(let frame=0;frame<90;frame++)jumper.update(1/60,new THREE.Vector2(0,1),[],false);
+  assert.ok(jumper.group.position.z>beforeSwim.z+1,'the player keeps moving in water instead of being blocked by its unwalkable grid');
   const bodyPhysics=new RagdollSystem(scene,grid,world);
   const floating=bodyPhysics.spawn(new THREE.Vector3(waterX,CANAL_BED_Y,waterZ),0,new THREE.Vector3(),
     {shirt:'#37a8a0',pants:'#394f60',skin:'#e9c49d',shoes:'#263b47'});
@@ -1432,4 +1441,26 @@ test('intact paving hides its buried support and movement cannot skip a thin wal
   walker.group.position.set(.85,0,6);walker.velocity.set(11.5,0,0);
   walker.update(.1,new THREE.Vector2(1,0),[],true);
   assert.ok(walker.group.position.x<1,'swept movement stops before the wall');
+});
+
+test('downloaded Crawling clip is baked into moving joint targets for the physical wounded body', async () => {
+  const { bakeCrawlMotion, sampleJointMotion } = await import('../src/actors/JointAnimation');
+  const bytes=readFileSync('public/animations/mixamo/crawl.fbx');
+  const rig=new FBXLoader().parse(bytes.buffer.slice(bytes.byteOffset,bytes.byteOffset+bytes.byteLength) as ArrayBuffer,'');
+  const baked=bakeCrawlMotion(rig,rig.animations[0]);
+  const shipped=JSON.parse(readFileSync('public/animations/mixamo/crawl-motion.json','utf8'));
+  assert.equal(shipped.source,'Mixamo/Crawling.fbx');
+  assert.equal(shipped.frames.length,baked.frames.length);
+  assert.deepEqual(shipped.frames[8],JSON.parse(JSON.stringify(baked.frames[8])), 'the runtime table is produced from the downloaded FBX, not a hand-authored pose');
+  const first=sampleJointMotion(baked,0,6,new THREE.Vector3());
+  const later=sampleJointMotion(baked,.6,6,new THREE.Vector3());
+  assert.ok(first.distanceTo(later)>.1,'the hand actually reaches through the crawl cycle');
+  assert.ok(shipped.frames.every((frame:number[])=>frame.length===48&&frame.every(Number.isFinite)));
+});
+
+test('clipped terrain omits hidden cells instead of emitting invalid triangles', () => {
+  const surface=meshTerrainSurface(3,3,new Float32Array([0,0,0,0,NaN,0,0,0,0]),S,0,0,()=>0,()=>false);
+  assert.ok(surface.positions.every(Number.isFinite));
+  const area=surface.indexes.length;
+  assert.ok(area>6&&area<=24,'the four rectangles surround the missing voxel without a full grid');
 });

@@ -43,17 +43,21 @@ export interface InteriorPiece {
   ownsGeometry: boolean;
   ownsState?: boolean;
   groundObstacle?: boolean;
+  inverseWorld?: THREE.Matrix4;
+  renderParent?: THREE.Object3D;
   batch?: { mesh: THREE.InstancedMesh; index: number; parent: THREE.Group };
   aggregate?: { mesh: THREE.Mesh; pieces: InteriorPiece[] };
 }
 export interface PedestrianAnchor { cell: Cell; type: BuildingPlan['type']; district: District }
 export interface PublicAnchor { cell: Cell; activity: 'rest' | 'browse' | 'wait' }
-export type CityLightAnchor = { object: THREE.Object3D; position: THREE.Vector3; kind: 'street' | 'signal' | 'interior'; color: string; power: number; range: number };
+export type CityLightAnchor = { object: THREE.Object3D; position: THREE.Vector3; kind: 'street' | 'signal' | 'interior'; color: string; power: number; range: number; pieces: InteriorPiece[] };
+type GroundLayer = { size: number; heights: Float32Array; hidden: Uint8Array; width: number; depth: number; x0: number; z0: number; cutouts: import('./SurfacePatches').SurfaceCutout[] };
 type GroundMark = { x: number; z: number; radius: number; strength: number };
 type BlockAssets = {
   bx: number; bz: number; props: THREE.Group; meshes: THREE.Object3D[]; interiors: THREE.Group[];
   waterFlow?: THREE.InstancedMesh;
   firstVoxel: number; lastVoxel: number; regions: Map<string, ShellRegion>; distance: number;
+  lodDistance?: number;
   active: boolean; released: boolean; mode: 'near' | 'far' | 'off';
 };
 type ShellRegion = {
@@ -184,6 +188,8 @@ export class PrefabManager {
   private buildingDecorations: Array<{ first: number; last: number; group: THREE.Group; occupied: number[] }> = [];
   private interiorAreas: Array<{ x0: number; x1: number; z0: number; z1: number; upper: number[] }> = [];
   private dummy = new THREE.Object3D();
+  private readonly occupancyProbe = new THREE.Vector3();
+  private readonly dirtyAggregates = new Set<{ mesh: THREE.Mesh; pieces: InteriorPiece[] }>();
   private voxelsByCell = new Map<number, number[]>();
   private entranceApproaches = new Set<number>();
   private curbGeometry = new THREE.PlaneGeometry(VOXEL_SIZE, 0.07);
@@ -194,6 +200,7 @@ export class PrefabManager {
   private readonly groundMarks: GroundMark[] = [];
   private readonly damagedRoadVoxels = new Map<string, number>();
   private groundVisible = true;
+  private readonly dirtyGround = new Set<THREE.Mesh>();
   private meshWorker: Worker;
   private nextMeshRequest = 1;
   private meshRequests = new Map<number, MeshRequest>();
@@ -204,7 +211,7 @@ export class PrefabManager {
   private readonly plansByBlock = new Map<string, BuildingPlan[]>();
   private readonly viewFrustum = new THREE.Frustum();
   private readonly viewMatrix = new THREE.Matrix4();
-  private readonly viewSphere = new THREE.Sphere();
+  private readonly viewBox = new THREE.Box3();
   private waterTime = 0;
 
   private facadePaint(district: District, gx: number, gz: number): THREE.Color {
@@ -370,9 +377,9 @@ export class PrefabManager {
     const [x1, z1] = this.grid.world(bounds.x1, bounds.z1);
     const x = (x0 + x1) / 2, z = (z0 + z1) / 2;
     if (Math.hypot(x - player.x, z - player.z) > 155) return false;
-    this.viewSphere.center.set(x, 9, z);
-    this.viewSphere.radius = Math.hypot((x1 - x0) / 2, (z1 - z0) / 2, 9) + 15;
-    return this.viewFrustum.intersectsSphere(this.viewSphere);
+    this.viewBox.min.set(x0 - 3, -5, z0 - 3);
+    this.viewBox.max.set(x1 + 1, 32, z1 + 1);
+    return this.viewFrustum.intersectsBox(this.viewBox);
   }
 
   updateCameraVisibility(camera: THREE.Camera, player: THREE.Vector3): void {
@@ -431,6 +438,7 @@ export class PrefabManager {
     yield;
     this.registerStaticPieces(decorationRoots);
     this.resolveStaticVoxelOverlaps(firstVoxel, this.voxels.length, firstPiece);
+    this.clipGroundToStaticVoxels(firstPiece);
     this.aggregateStaticSurfaces(roots);
     this.aggregateVoxelDecorations(decorationRoots);
     this.registerCityLights(roots);
@@ -439,6 +447,13 @@ export class PrefabManager {
     this.scene.add(props);
     props.updateMatrixWorld(true);
     props.traverse((object) => { object.matrixAutoUpdate = false; object.matrixWorldAutoUpdate = false; });
+    // Logical voxels stay available to collision/damage. Their hidden source
+    // meshes do not need to be traversed by every render and AO pass.
+    for (const piece of this.interiorPieces.slice(firstPiece)) if (piece.aggregate || piece.batch) {
+      piece.renderParent = piece.mesh.parent ?? undefined;
+      piece.inverseWorld = piece.mesh.matrixWorld.clone().invert();
+      piece.mesh.removeFromParent();
+    }
     const assets: BlockAssets = {
       bx: bounds.bx, bz: bounds.bz, props, meshes: [], interiors: this.interiorLodGroups.slice(interiorCount),
       waterFlow: props.getObjectByName('canal-flow') as THREE.InstancedMesh | undefined,
@@ -519,6 +534,9 @@ export class PrefabManager {
         assets.active = true;
       }
       assets.released = false;
+      const lodDistance = distance <= 1 ? 1 : 2;
+      if (assets.lodDistance === lodDistance && assets.mode !== 'off') return;
+      assets.lodDistance = lodDistance;
       assets.props.traverse(o=>{if(o.userData.microNature)o.visible=distance<=1;});
       for (const group of assets.interiors) group.visible = distance <= 1;
       for (const mesh of assets.meshes) if (mesh.parent !== this.buildings) this.buildings.add(mesh);
@@ -590,8 +608,16 @@ export class PrefabManager {
             material instanceof THREE.MeshStandardMaterial && !material.map) pieces.push(piece);
       });
     }
-    if (pieces.length < 2) return;
+    const groups = new Map<string, InteriorPiece[]>();
+    for (const piece of pieces) {
+      const key = `${Math.floor(piece.center.x / 8.8)}:${Math.floor(piece.center.z / 8.8)}`;
+      const group = groups.get(key) ?? []; group.push(piece); groups.set(key, group);
+    }
+    for (const group of groups.values()) this.createDecorationAggregate(group, roots);
+  }
 
+  private createDecorationAggregate(pieces: InteriorPiece[], roots: THREE.Object3D[]): void {
+    if (pieces.length < 2) return;
     const surface = meshVoxelDecorations(pieces.map((piece) => piece.mesh));
     if (!surface?.indexes.length) return;
     const geometry = new THREE.BufferGeometry();
@@ -653,7 +679,8 @@ export class PrefabManager {
       if (root.userData.dynamicVehicle || root instanceof THREE.InstancedMesh) continue;
       root.updateMatrixWorld(true);
       root.traverse((object) => {
-        if (!(object instanceof THREE.Mesh) || object instanceof THREE.InstancedMesh || this.interiorPieceByMesh.has(object)) return;
+        if (!(object instanceof THREE.Mesh) || object instanceof THREE.InstancedMesh || this.interiorPieceByMesh.has(object) ||
+            object.userData.terrainFoundation || object.name === 'canal-water') return;
         const dimensions = object.userData.voxelDimensions as VoxelDimensions | undefined;
         if (!dimensions) return;
         const count = dimensions.nx * dimensions.ny * dimensions.nz;
@@ -663,6 +690,7 @@ export class PrefabManager {
           mesh: object, center: object.getWorldPosition(new THREE.Vector3()), bounds: new THREE.Box3().setFromObject(object),
           alive: true, dimensions, ...state, ownsState: Boolean(customMask),
           palette: object.userData.voxelPalette as Float32Array | undefined,
+          inverseWorld: object.matrixWorld.clone().invert(),
           ownsGeometry: Boolean(dimensions.signUv || object.userData.ownsVoxelGeometry), groundObstacle: Boolean(object.parent?.userData.groundFurniture)
         };
         this.interiorPieces.push(piece);
@@ -727,8 +755,15 @@ export class PrefabManager {
       voxel.alive = this.hasPieces(voxel);
     }
     const point = new THREE.Vector3();
-    for (const piece of this.interiorPieces.slice(firstPiece)) {
-      if (!piece.alive || piece.dimensions.signUv || piece.mesh.userData.dynamicVehicle) continue;
+    const incoming = this.interiorPieces.slice(firstPiece);
+    const incomingBounds = new THREE.Box3();
+    for (const piece of incoming) incomingBounds.union(piece.bounds);
+    // Include surviving scenery from neighboring generated chunks. Their
+    // border props must not acquire a second copy when this chunk arrives.
+    const neighbors = this.interiorPieces.slice(0, firstPiece).filter(piece =>
+      piece.alive && !piece.mesh.userData.dynamicVehicle && piece.bounds.intersectsBox(incomingBounds));
+    for (const piece of [...neighbors, ...incoming]) {
+      if (!piece.alive || piece.mesh.userData.dynamicVehicle) continue;
       const { nx, ny, nz } = piece.dimensions;
       const size = piece.dimensions.voxelSize ?? VOXEL_SIZE;
       piece.mesh.updateWorldMatrix(true, false);
@@ -739,6 +774,15 @@ export class PrefabManager {
         return values.filter((value) => Math.abs(value) > 0.001).length !== 1 ||
           values.some((value) => Math.abs(value) > 0.001 && Math.abs(Math.abs(value) - 1) > 0.001);
       })) continue;
+      if (neighbors.includes(piece)) {
+        for (let y = 0; y < ny; y++) for (let z = 0; z < nz; z++) for (let x = 0; x < nx; x++) {
+          if (!piece.mask[x + nx * (z + nz * y)]) continue;
+          point.set((x-(nx-1)/2)*size,(y-(ny-1)/2)*size,(z-(nz-1)/2)*size).applyMatrix4(piece.mesh.matrixWorld);
+          if (!incomingBounds.containsPoint(point)) continue;
+          for (const key of keysAt(point,size)) occupied.add(key);
+        }
+        continue;
+      }
       let changed = false;
       for (let y = 0; y < ny; y++) for (let z = 0; z < nz; z++) for (let x = 0; x < nx; x++) {
         const sub = x + nx * (z + nz * y);
@@ -757,7 +801,7 @@ export class PrefabManager {
       piece.mesh.userData.voxelMask = piece.mask;
       piece.alive = piece.mask.some(Boolean);
       if (piece.ownsGeometry) piece.mesh.geometry.dispose();
-      piece.mesh.geometry = voxelSurfaceGeometry(nx, ny, nz, piece.mask, false, piece.palette, size);
+      piece.mesh.geometry = voxelSurfaceGeometry(nx, ny, nz, piece.mask, piece.dimensions.signUv, piece.palette, size);
       piece.ownsGeometry = true;
       piece.mesh.visible = piece.alive;
     }
@@ -767,14 +811,19 @@ export class PrefabManager {
     for (const root of roots) root.traverse((object) => {
       const kind = object.userData.cityLight as CityLightAnchor['kind'] | undefined;
       if (!kind) return;
+      const pieces: InteriorPiece[] = [];
+      object.traverse(child => { const piece=this.interiorPieceByMesh.get(child); if(piece)pieces.push(piece); });
       this.lightAnchors.push({ object, position: object.getWorldPosition(new THREE.Vector3()),
+        pieces,
         kind, color: object.userData.lightColor || (kind === 'signal' ? '#f58e72' : '#ffe0a4'),
         power: kind === 'interior' ? 18 : kind === 'signal' ? 6 : 28, range: kind === 'interior' ? 8 : 11 });
     });
   }
 
   cityLightActive(anchor: CityLightAnchor): boolean {
-    if (!anchor.object.parent || !this.isWorldActive(anchor.position.x, anchor.position.z)) return false;
+    if (!this.isWorldActive(anchor.position.x, anchor.position.z)) return false;
+    if (anchor.pieces.length) return anchor.pieces.some(piece => piece.alive);
+    if (!anchor.object.parent) return false;
     if (anchor.object instanceof THREE.Mesh) {
       const piece = this.interiorPieceByMesh.get(anchor.object);
       return !piece || piece.alive;
@@ -810,7 +859,21 @@ export class PrefabManager {
     const vx = Math.floor((x + size / 2) / size), vz = Math.floor((z + size / 2) / size);
     const key = `${vx}:${vz}`;
     const health = Math.max(0, (this.damagedRoadVoxels.get(key) ?? 1.55) - Math.max(0, amount));
+    if (health <= 0 && this.grid.roadSurfaceDepth.has(key)) return null;
     this.damagedRoadVoxels.set(key, health);
+    if (health <= 0) {
+      this.grid.roadSurfaceDepth.set(key, CITY_VOXEL_SIZE);
+      for (const ground of this.groundMeshesNear(x, z, CITY_VOXEL_SIZE)) {
+        const layer = ground.userData.groundLayer as GroundLayer;
+        const cx=vx*size,cz=vz*size;
+        for(let iz=Math.floor((cz-size/2-layer.z0)/layer.size);iz<Math.round((cz+size/2-layer.z0)/layer.size);iz++)
+          for(let ix=Math.floor((cx-size/2-layer.x0)/layer.size);ix<Math.round((cx+size/2-layer.x0)/layer.size);ix++) {
+            if(ix<0||iz<0||ix>=layer.width||iz>=layer.depth)continue;
+            layer.heights[ix+iz*layer.width]=-CITY_VOXEL_SIZE;
+          }
+        this.dirtyGround.add(ground);
+      }
+    }
     const centerX = vx * size, centerZ = vz * size;
     const strength = health <= 0 ? 0.96 : 0.28 + (1 - health / 1.55) * 0.42;
     const mark = { x: centerX, z: centerZ, radius: size * (health <= 0 ? 0.36 : 0.24), strength };
@@ -818,6 +881,75 @@ export class PrefabManager {
     if (this.groundMarks.length > 256) this.groundMarks.shift();
     for (const ground of this.groundTiles) this.paintGroundMark(ground, mark);
     return new THREE.Color(health <= 0 ? '#27323a' : '#42525d');
+  }
+
+  private clipGroundToStaticVoxels(firstPiece: number): void {
+    for (const piece of this.interiorPieces.slice(firstPiece)) {
+      if (!piece.alive || piece.mesh.userData.terrainFoundation) continue;
+      for (const ground of this.groundMeshesNear(piece.center.x,piece.center.z,
+        Math.max(piece.bounds.max.x-piece.bounds.min.x,piece.bounds.max.z-piece.bounds.min.z)/2)) {
+        const list=ground.userData.coverPieces as InteriorPiece[] ?? [];
+        list.push(piece);ground.userData.coverPieces=list;
+        const base=this.grid.terrain.height(piece.center.x,piece.center.z);
+        if(piece.bounds.min.y<=base+.08&&piece.bounds.max.y>=base-.001)this.dirtyGround.add(ground);
+      }
+    }
+  }
+
+  flushGroundDamage(): void {
+    const deadline=performance.now()+3;
+    for (const ground of this.dirtyGround) {
+      const layer = ground.userData.groundLayer as GroundLayer;
+      layer.hidden.fill(0);
+      for(const piece of ground.userData.coverPieces as InteriorPiece[] ?? []) {
+        if(!piece.alive)continue;
+        const x0=Math.max(0,Math.floor((piece.bounds.min.x-layer.x0)/layer.size));
+        const x1=Math.min(layer.width-1,Math.floor((piece.bounds.max.x-layer.x0)/layer.size));
+        const z0=Math.max(0,Math.floor((piece.bounds.min.z-layer.z0)/layer.size));
+        const z1=Math.min(layer.depth-1,Math.floor((piece.bounds.max.z-layer.z0)/layer.size));
+        for(let z=z0;z<=z1;z++)for(let x=x0;x<=x1;x++) {
+          const wx=layer.x0+(x+.5)*layer.size,wz=layer.z0+(z+.5)*layer.size;
+          const y=this.grid.terrain.height(wx,wz)+layer.heights[x+z*layer.width];
+          if(y<piece.bounds.min.y-.001||y>piece.bounds.max.y+.001)continue;
+          if(this.pieceOccupies(piece,wx,y-.001,wz)||this.pieceOccupies(piece,wx,y+.001,wz))layer.hidden[x+z*layer.width]=1;
+        }
+      }
+      const heights = layer.heights.slice();
+      for (let i = 0; i < heights.length; i++) if (layer.hidden[i]) heights[i] = NaN;
+      const result = meshTerrainSurface(layer.width, layer.depth, heights, layer.size, layer.x0, layer.z0,
+        (x,z) => this.grid.terrain.height(x,z), () => false, layer.cutouts);
+      const positions = Array.from(result.positions), uvs = Array.from(result.uvs), indexes = Array.from(result.indexes);
+      // Emit the exposed risers of the remaining asphalt, so a crater has real
+      // thickness and never exposes the empty background below the terrain.
+      for (let z = 0; z < layer.depth; z++) for (let x = 0; x < layer.width; x++) {
+        const height = heights[x + z * layer.width];
+        if (!Number.isFinite(height) || height >= 0) continue;
+        const x0 = layer.x0 + x * layer.size, z0 = layer.z0 + z * layer.size;
+        for (const [dx,dz] of [[-1,0],[1,0],[0,-1],[0,1]]) {
+          const nx = x+dx, nz = z+dz;
+          if (nx < 0 || nz < 0 || nx >= layer.width || nz >= layer.depth) continue;
+          const top = heights[nx + nz * layer.width];
+          if (!Number.isFinite(top) || top <= height) continue;
+          const a = dx ? [x0+(dx>0?layer.size:0), z0] : [x0,z0+(dz>0?layer.size:0)];
+          const b = dx ? [a[0],z0+layer.size] : [x0+layer.size,a[1]];
+          const first=positions.length/3;
+          const ea=this.grid.terrain.height(a[0],a[1]),eb=this.grid.terrain.height(b[0],b[1]);
+          positions.push(a[0],ea+height,a[1],b[0],eb+height,b[1],b[0],eb+top,b[1],a[0],ea+top,a[1]);
+          for (let i=0;i<4;i++) uvs.push((x+.5)/layer.width,(z+.5)/layer.depth);
+          // Walls face into the removed voxel.
+          if(dx===1||dz===-1)indexes.push(first,first+1,first+2,first,first+2,first+3);
+          else indexes.push(first,first+2,first+1,first,first+3,first+2);
+        }
+      }
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));
+      geometry.setAttribute('uv',new THREE.Float32BufferAttribute(uvs,2));
+      geometry.setIndex(indexes);geometry.computeVertexNormals();geometry.computeBoundingSphere();
+      geometry.userData.surfaceStats={cells:layer.width*layer.depth/(VOXELS_PER_CELL*VOXELS_PER_CELL),quads:indexes.length/6};
+      ground.geometry.dispose();ground.geometry=geometry;
+      this.dirtyGround.delete(ground);
+      if(performance.now()>=deadline)break;
+    }
   }
 
   private paintGroundMark(ground: THREE.Mesh, mark: GroundMark): void {
@@ -1075,6 +1207,32 @@ export class PrefabManager {
     }
   }
 
+  flushStaticDamage(): void {
+    const deadline = performance.now() + 3;
+    for (const state of this.dirtyAggregates) {
+      const surface = meshVoxelDecorations(state.pieces.map(piece => piece.mesh));
+      if (surface) {
+        const geometry = new THREE.BufferGeometry();
+        for (let i = 0; i < surface.positions.length; i++) surface.positions[i] *= VOXEL_SIZE;
+        geometry.setAttribute('position', new THREE.BufferAttribute(surface.positions, 3));
+        geometry.setAttribute('normal', new THREE.BufferAttribute(surface.normals, 3));
+        geometry.setAttribute('color', new THREE.BufferAttribute(surface.colors, 3));
+        geometry.setIndex(new THREE.BufferAttribute(surface.indexes, 1));
+        geometry.userData.decorationPieceForFace = surface.voxelForFace;
+        // The generator emits world coordinates. Original floor aggregates
+        // can live under an elevated building group rather than a world root.
+        geometry.applyMatrix4(state.mesh.matrixWorld.clone().invert());
+        geometry.computeBoundingSphere();
+        state.mesh.geometry.dispose(); state.mesh.geometry = geometry;
+        state.mesh.material = voxelDecorationMaterial;
+        state.mesh.visible = Boolean(surface.indexes.length);
+      }
+      this.dirtyAggregates.delete(state);
+      if (performance.now() >= deadline) break;
+    }
+    this.flushGroundDamage();
+  }
+
   private roadMarkings(bounds: BlockBounds): Array<{ x: number; z: number; w: number; d: number; paint: string }> {
     const [x0, z0] = this.grid.world(bounds.x0, bounds.z0);
     const centerX = x0 + this.grid.cellSize;
@@ -1172,6 +1330,13 @@ export class PrefabManager {
     geometry.userData.surfaceStats = { cells: cells.length, quads: surface.quads };
     const ground = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ map: texture, roughness: 1 }));
     ground.name = 'chunk-ground'; ground.receiveShadow = true; ground.visible = this.groundVisible;
+    const fineWidth=width*2,fineDepth=depth*2;
+    const fineHeights = new Float32Array(fineWidth * fineDepth);
+    for (let z=0;z<fineDepth;z++) for(let x=0;x<fineWidth;x++) {
+      fineHeights[x+z*fineWidth]=heights[Math.floor(x/(CITY_VOXELS_PER_CELL*2))+Math.floor(z/(CITY_VOXELS_PER_CELL*2))*cellWidth];
+    }
+    ground.userData.groundLayer = { size: VOXEL_SIZE, heights: fineHeights, hidden: new Uint8Array(fineWidth*fineDepth), width:fineWidth, depth:fineDepth,
+      x0:firstX-this.grid.cellSize/2,z0:firstZ-this.grid.cellSize/2,cutouts } satisfies GroundLayer;
     ground.userData.groundPixels = pixels;
     ground.userData.groundBounds = { x0: firstX - this.grid.cellSize / 2, z0: firstZ - this.grid.cellSize / 2,
       width, depth, size: CITY_VOXEL_SIZE };
@@ -1371,7 +1536,8 @@ export class PrefabManager {
       const normal = hit.face.normal.clone().transformDirection(surface.matrixWorld);
       const state = pieces?.find((piece) => {
         const size = piece.dimensions.voxelSize ?? VOXEL_SIZE;
-        return piece.alive && piece.bounds.containsPoint(hit.point.clone().addScaledVector(normal, -size * 0.08));
+        const point = hit.point.clone().addScaledVector(normal, -size * 0.08);
+        return piece.alive && piece.bounds.containsPoint(point) && this.pieceOccupies(piece, point.x, point.y, point.z);
       });
       if (state) return state;
     }
@@ -1428,7 +1594,8 @@ export class PrefabManager {
   }
 
   private pieceOccupies(piece: InteriorPiece, x: number, y: number, z: number): boolean {
-    const point = piece.mesh.worldToLocal(new THREE.Vector3(x, y, z));
+    const inverse = piece.inverseWorld ?? piece.mesh.matrixWorld.clone().invert();
+    const point = this.occupancyProbe.set(x, y, z).applyMatrix4(inverse);
     const { nx, ny, nz } = piece.dimensions;
     const voxelSize = piece.dimensions.voxelSize ?? VOXEL_SIZE;
     const ix = Math.floor(point.x / voxelSize + nx / 2);
@@ -1446,10 +1613,7 @@ export class PrefabManager {
     if (!subs.length || !piece.alive) return;
     this.preparePieceDamage(piece);
     if (piece.aggregate) {
-      const { mesh, pieces } = piece.aggregate;
-      mesh.parent?.remove(mesh);
-      mesh.geometry.dispose();
-      for (const entry of pieces) { entry.aggregate = undefined; entry.mesh.visible = entry.alive; }
+      this.dirtyAggregates.add(piece.aggregate);
     }
     if (piece.batch) {
       const { mesh, index, parent } = piece.batch;
@@ -1475,6 +1639,12 @@ export class PrefabManager {
     }
     piece.alive = piece.mask.some((value) => value !== 0);
     const voxelSize = piece.dimensions.voxelSize ?? VOXEL_SIZE;
+    piece.mesh.userData.voxelMask = piece.mask;
+    for(const ground of this.groundMeshesNear(piece.center.x,piece.center.z,
+      Math.max(piece.bounds.max.x-piece.bounds.min.x,piece.bounds.max.z-piece.bounds.min.z)/2)) {
+      if((ground.userData.coverPieces as InteriorPiece[] | undefined)?.includes(piece))this.dirtyGround.add(ground);
+    }
+    if (piece.aggregate) return;
     if (piece.ownsGeometry) piece.mesh.geometry.dispose();
     if (piece.alive) {
       const { nx, ny, nz, signUv } = piece.dimensions;
@@ -1554,6 +1724,7 @@ export class PrefabManager {
       for (const piece of this.interiorObstaclesByCell.get(this.grid.index(nearby.x, nearby.z)) || []) {
         if (!piece.alive || piece.mesh.parent?.visible === false) continue;
         const box = piece.bounds;
+        if (piece.mesh.userData.walkSurfaceIds && box.max.y <= feetY + .52) continue;
         if (box.max.y < feetY + 0.25 || box.min.y > feetY + 1.55) continue;
         if (x <= box.min.x - 0.27 || x >= box.max.x + 0.27 || z <= box.min.z - 0.27 || z >= box.max.z + 0.27) continue;
         for (const ox of [-0.23, 0, 0.23]) for (const oz of [-0.23, 0, 0.23]) {

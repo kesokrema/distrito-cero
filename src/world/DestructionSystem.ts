@@ -117,6 +117,15 @@ export class DestructionSystem {
 
   blast(x: number, z: number, radius = 4.1, source: 'player' | 'enemy' = 'player', y = 0.9): number {
     if (y - this.grid.groundHeight(x, z) < 2.2) this.prefabs.scorchGround(x, z, radius * 0.8);
+    // Retire the asphalt layer under a low explosion, not merely its paint.
+    const roadStep = 0.44;
+    for (let rz = Math.floor((z-radius)/roadStep); rz <= Math.ceil((z+radius)/roadStep); rz++) {
+      for (let rx = Math.floor((x-radius)/roadStep); rx <= Math.ceil((x+radius)/roadStep); rx++) {
+        const px=rx*roadStep,pz=rz*roadStep;
+        if(Math.hypot(px-x,pz-z)>radius)continue;
+        if(Math.abs(y-this.grid.groundHeight(px,pz))<radius*.65) this.damageRoadSurface(px,pz,4);
+      }
+    }
     const changed = new Set<number>();
     let destroyed = 0;
     for (const index of this.prefabs.voxelIndexesNear(x, z, radius + 1.7)) {

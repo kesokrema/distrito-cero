@@ -366,3 +366,40 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
     font-size: 8px;
   }
 }
+
+/* Thumb controls: analog movement, a dedicated look pad, captured holds. */
+#app[data-input-mode="touch"] .mobile-controls { position:absolute;inset:0;display:block;pointer-events:none; }
+#app[data-input-mode="touch"] .touch-stick {
+  position:absolute;width:118px;height:118px;bottom:max(28px,env(safe-area-inset-bottom));
+  border:2px solid #b4e1d34a;border-radius:50%;background:#0d202a65;pointer-events:auto;touch-action:none;
+  user-select:none;-webkit-user-select:none;display:grid;place-items:center;
+}
+#touch-move { left:max(18px,env(safe-area-inset-left)); }
+#touch-look { right:max(18px,env(safe-area-inset-right)); }
+.touch-nub { width:50px;height:50px;border-radius:50%;background:#caeadd55;border:2px solid #f2fff183;pointer-events:none; }
+.touch-stick[data-active="true"] { border-color:#50e4c4 !important;background:#154b4970 !important; }
+.touch-stick small { position:absolute;bottom:8px;color:#e6f5ecb0;font-size:9px;letter-spacing:1.5px;pointer-events:none; }
+#app[data-input-mode="touch"] .mobile-actions { position:absolute;right:max(16px,env(safe-area-inset-right));bottom:max(163px,calc(env(safe-area-inset-bottom) + 145px));display:grid;grid-template-columns:56px 65px;gap:8px; }
+#app[data-input-mode="touch"] .mobile-actions button { width:100%;height:49px;min-width:0;font-size:10px;padding:0;border-radius:15px; }
+#app[data-input-mode="touch"] .mobile-actions #mobile-fire { width:65px;min-width:0;height:58px;background:#218f78dc;border-color:#66e6c5; }
+#app[data-input-mode="touch"] .touch-tools { position:absolute;bottom:max(14px,env(safe-area-inset-bottom));left:50%;transform:translateX(-50%);display:grid;grid-template-columns:50px 50px;gap:5px;pointer-events:auto; }
+#app[data-input-mode="touch"] .touch-tools button { height:35px;min-height:35px;padding:0 3px;font-size:8px; }
+#app[data-input-mode="touch"] .hotbar { bottom:92px;left:50%;transform:translateX(-50%); }
+#app[data-input-mode="touch"] .hotbar > button { display:none; }
+#app[data-input-mode="touch"] .ammo-panel { min-width:90px;text-align:center; }
+#app[data-input-mode="touch"] .toast,#app[data-input-mode="touch"] .interaction-prompt { bottom:285px;max-width:85vw; }
+#app[data-input-mode="touch"] .bottom-bar,#app[data-input-mode="touch"] .district-row,#app[data-input-mode="touch"] .objective,#app[data-input-mode="touch"] .brand small { display:none; }
+#app[data-input-mode="touch"] .hud-left { width:158px;padding:9px; }
+#app[data-input-mode="touch"] .brand span { font-size:19px; }
+#app[data-input-mode="touch"] .health-row { margin-top:7px; }
+#app[data-input-mode="touch"] .hud-right { width:78px;min-height:0; }
+#app[data-input-mode="touch"] .top-center { display:none; }
+#app[data-input-mode="touch"] .camera-picker,#app[data-input-mode="touch"] .camera-reset,
+#app[data-input-mode="touch"] .ground-toggle,#app[data-input-mode="touch"] .wireframe-toggle { display:none; }
+@media(max-height:500px) {
+  #app[data-input-mode="touch"] .touch-stick { width:104px;height:104px;bottom:14px; }
+  #app[data-input-mode="touch"] .mobile-actions { bottom:130px;grid-template-columns:56px 62px;gap:5px; }
+  #app[data-input-mode="touch"] .mobile-actions button { height:38px; }
+  #app[data-input-mode="touch"] .mobile-actions #mobile-fire { height:45px;width:62px; }
+  #app[data-input-mode="touch"] .toast,#app[data-input-mode="touch"] .interaction-prompt { bottom:115px; }
+}

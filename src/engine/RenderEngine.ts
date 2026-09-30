@@ -53,6 +53,11 @@ export class RenderEngine {
   setGroundProbe(probe:(x:number,z:number,y:number)=>number):void{this.groundProbe=probe;}
   private wireframeEnabled = false;
   private cockpitVehicle: THREE.Group | null = null;
+  private lastShadowUpdate = -Infinity;
+  private readonly mobile = matchMedia('(pointer: coarse)').matches;
+  private adaptiveAO = true;
+  private renderCost = 0;
+  private renderedFrames = 0;
 
   constructor(container: HTMLElement) {
     // A pale blue-green haze keeps the far blocks readable while giving the
@@ -60,19 +65,21 @@ export class RenderEngine {
     this.scene.background = new THREE.Color('#b8c9c4');
     this.scene.fog = new THREE.Fog('#b8c9c4', 145, 300);
     this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.25));
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, this.mobile ? 1 : 1.25));
+    this.renderer.info.autoReset = false;
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.14;
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFShadowMap;
+    this.renderer.shadowMap.autoUpdate = false;
     container.appendChild(this.renderer.domElement);
     this.hemi = new THREE.HemisphereLight('#e5efff', '#596d47', 0.86);
     this.scene.add(this.hemi);
     this.sun = new THREE.DirectionalLight('#ffd29b', 2.84);
     this.sun.position.set(-34, 68, 26);
     this.sun.castShadow = true;
-    this.sun.shadow.mapSize.set(2048, 2048);
+    this.sun.shadow.mapSize.set(this.mobile ? 1024 : 2048, this.mobile ? 1024 : 2048);
     this.sun.shadow.camera.left = -42;
     this.sun.shadow.camera.right = 42;
     this.sun.shadow.camera.top = 42;
@@ -104,7 +111,8 @@ export class RenderEngine {
     this.ssao.minDistance = 0.001;
     this.ssao.maxDistance = 0.055;
     const aoMode = new URLSearchParams(window.location.search).get('ao');
-    if (aoMode === '0') this.ssao.enabled = false;
+    this.adaptiveAO = aoMode === null;
+    if (aoMode === '0' || (this.mobile && aoMode !== '1')) this.ssao.enabled = false;
     this.composer.addPass(this.ssao);
     this.composer.addPass(new OutputPass());
     this.resize();
@@ -429,7 +437,22 @@ export class RenderEngine {
 
   get isWireframe(): boolean { return this.wireframeEnabled; }
 
-  render(): void { this.composer.render(); }
+  render(): void {
+    // Static city shadows need not redraw the full scene on every frame.
+    const now = performance.now();
+    if (now - this.lastShadowUpdate >= (this.mobile ? 200 : 125)) {
+      this.renderer.shadowMap.needsUpdate = true;
+      this.lastShadowUpdate = now;
+    }
+    this.renderer.info.reset();
+    const start = performance.now();
+    this.composer.render();
+    // Voxel corner AO is baked into the chunk mesh at every quality level.
+    // Drop only the extra screen-space passes when they exceed the frame
+    // budget on a slow GPU/driver; explicit ?ao=1 remains useful for comparison.
+    this.renderCost = this.renderCost * .95 + (performance.now() - start) * .05;
+    if (++this.renderedFrames > 80 && this.adaptiveAO && this.renderCost > 22) this.ssao.enabled = false;
+  }
   dispose(): void {
     this.atmosphere.dispose();
     this.viewCloth.dispose(); this.viewSkin.dispose(); this.wireframeMaterial.dispose();

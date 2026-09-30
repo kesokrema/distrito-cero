@@ -15,6 +15,7 @@ export class UrbanLandscape {
     const floor=this.box(root,s.x1-s.x0,VOXEL_SIZE,s.z1-s.z0,
       (s.x0+s.x1)/2,height-VOXEL_SIZE/2,(s.z0+s.z1)/2,'#998b6c');
     floor.name='voxel-earth-foundation';floor.castShadow=false;
+    floor.userData.terrainFoundation=true;
     this.grid.surfaces.add({...s,id:s.id+':earth',kind:'promenade',navigable:false,height,endHeight:undefined,enabled:undefined});
   }
   build(bounds:BlockBounds):THREE.Group {
@@ -66,7 +67,8 @@ export class UrbanLandscape {
     water.position.set((x0+x1)/2,CANAL_SURFACE_Y-VOXEL_SIZE/2,(z0+z1)/2);
     water.receiveShadow=true;water.name='canal-water';water.userData.noObstacle=true;root.add(water);
     root.add(createCanalFlow({x0,x1,z0,z1,phase:this.grid.hash(b.bx,b.bz,771)}));
-    this.box(root,x1-x0,.44,z1-z0,(x0+x1)/2,CANAL_BED_Y-.22,(z0+z1)/2,'#586f63');
+    const bed=this.box(root,x1-x0,.44,z1-z0,(x0+x1)/2,CANAL_BED_Y-.22,(z0+z1)/2,'#586f63');
+    bed.name='canal-bed';bed.userData.terrainFoundation=true;
     const bridgeEnd=z0+this.grid.cellSize*3;
     for(const side of [-1,1]){
       const bank=side<0?x0:x1,cx=bank+side*1.1;
@@ -76,6 +78,11 @@ export class UrbanLandscape {
       this.grid.surfaces.add({id:id+':open',kind:'promenade',x0:cx-1.1,x1:cx+1.1,z0:bridgeEnd,z1,height:-3.52,solid:true});
       const path=this.box(root,2.2,.22,z1-z0,cx,-3.63,(z0+z1)/2,'#b1b4a0');path.userData.walkSurfaceIds=[id,id+':open'];
       this.foundation(root,this.grid.surfaces.surfaces.get(id)!,-3.96);
+      // Four real voxel risers let a body leave the stream without teleporting
+      // up the 0.88 m bank. This access continues beneath the bridge.
+      this.ramp(root,{id:id+':water-exit',kind:'stairs',
+        x0:bank-.44,x1:bank+.44,z0,z1,
+        height:side<0?-3.52:CANAL_BED_Y,endHeight:side<0?CANAL_BED_Y:-3.52,axis:'x',solid:false});
       this.grid.surfaces.add({...this.grid.surfaces.surfaces.get(id+':open')!,id:id+':earth-open',navigable:false,height:-3.96});
       const accessStart=Math.max(bridgeEnd+2.2,z1-22),accessEnd=z1-4.4;
       // A parallel ramp descends beside the lower path, with no wall across its landing.

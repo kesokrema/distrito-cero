@@ -85,5 +85,5 @@ export function meshVoxelDecorations(meshes: readonly THREE.Mesh[], gridSize = V
   }
 
   if (pieceCount < 2 || !cells.length) return null;
-  return meshVoxelCells(Float32Array.from(cells), Uint32Array.from(owners));
+  return meshVoxelCells(Float32Array.from(cells), Uint32Array.from(owners), true);
 }

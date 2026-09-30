@@ -1,5 +1,6 @@
 import { GroundPhysics } from '../engine/GroundPhysics';
 import * as THREE from 'three';
+import { ActorRenderBatch } from '../engine/ActorRenderBatch';
 import { FLOOR_HEIGHT } from '../world/VoxelConstants';
 import { EventBus } from '../core/EventBus';
 import { GridSystem, type BlockBounds, type Cell } from '../world/GridSystem';
@@ -64,6 +65,7 @@ export class NPCController {
   private readonly spatial = new SpatialHash<NPC>(4, (npc) => npc.group.position);
   private readonly vehicleSpatial = new SpatialHash<THREE.Group>(8, (vehicle) => vehicle.position);
   private readonly hitProbe = new THREE.Vector3();
+  private readonly actorBatch: ActorRenderBatch;
   private readonly mixamo = new MixamoAnimationSystem();
   private streetActivity = 1;
 
@@ -81,6 +83,7 @@ export class NPCController {
   }
 
   constructor(private scene: THREE.Scene, private grid: GridSystem, private events: EventBus, private destruction: DestructionSystem, private player: THREE.Object3D, private prefabs: PrefabManager, private ragdolls: RagdollSystem, activity = 1) {
+    this.actorBatch = new ActorRenderBatch(scene);
     this.streetActivity = activity;
     void this.mixamo.load();
     this.worker = new Worker(new URL('../workers/path.worker.ts', import.meta.url), { type: 'module' });
@@ -149,6 +152,7 @@ export class NPCController {
   }
 
   raycast(raycaster: THREE.Raycaster): { npc: NPC; point: THREE.Vector3; distance: number; part: BodyPart } | null {
+    raycaster.layers.enable(31);
     let best: { npc: NPC; point: THREE.Vector3; distance: number; part: BodyPart } | null = null;
     for (const npc of this.npcs) {
       if (!npc.alive) continue;
@@ -438,6 +442,7 @@ export class NPCController {
       feet: model.legs.map((leg) => leg.foot), bubble, motion: 0, phase: 0, heavy, mount: model.weaponMount,
       flash, parts, springs: new Map()
     } satisfies CharacterRig;
+    this.actorBatch?.add(group);
     group.userData.ragdollColors = { shirt: outfit.shirt, pants: outfit.pants, skin: outfit.skin, shoes: outfit.shoes };
     return group;
   }
@@ -1340,5 +1345,6 @@ export class NPCController {
   get civilians(): number { return this.npcs.filter((n) => n.kind === 'civilian' && n.alive).length; }
   get enemies(): number { return this.npcs.filter((n) => n.kind === 'enemy' && n.alive).length; }
   get panic(): number { return Math.round(this.npcs.filter((n) => n.kind === 'civilian' && n.alive).reduce((sum, n) => sum + n.panic, 0) / Math.max(1, this.civilians) * 100); }
-  dispose(): void { this.worker.terminate(); this.mixamo.dispose(); this.woundMaterial.dispose(); }
+  renderActors(): void { this.actorBatch?.update(); }
+  dispose(): void { this.actorBatch?.dispose(); this.worker.terminate(); this.mixamo.dispose(); this.woundMaterial.dispose(); }
 }

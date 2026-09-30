@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import './style.css';
+import { TouchStick } from './engine/TouchStick';
 import { EventBus } from './core/EventBus';
 import { GridSystem } from './world/GridSystem';
 import { PrefabManager } from './world/PrefabManager';
@@ -53,7 +54,12 @@ app.innerHTML = `
     <div><kbd>G</kbd><span>WIREFRAME</span></div>
     <div id="input-hint" class="input-hint">Mouse y teclado activos</div>
   </aside>
-  <div class="mobile-controls" aria-label="Controles táctiles"><div class="dpad"><button data-key="KeyW" aria-label="Arriba">▲</button><div><button data-key="KeyA" aria-label="Izquierda">◀</button><button data-key="KeyS" aria-label="Abajo">▼</button><button data-key="KeyD" aria-label="Derecha">▶</button></div></div><div class="mobile-actions"><button id="mobile-interact" aria-label="Interactuar">E</button><button id="mobile-medkit" aria-label="Usar botiquín">BOTIQUÍN</button><button id="mobile-reload" aria-label="Recargar">RECARGAR</button><button id="mobile-aim" aria-label="Apuntar">APUNTAR</button><button id="mobile-roll">SALTAR</button><button id="mobile-fire" class="fire-button">DISPARAR</button></div></div>
+  <div class="mobile-controls" aria-label="Controles táctiles">
+    <div id="touch-move" class="touch-stick" role="group" aria-label="Joystick de movimiento"><span class="touch-nub"></span><small>MOVER</small></div>
+    <div id="touch-look" class="touch-stick" role="group" aria-label="Joystick para apuntar y mirar"><span class="touch-nub"></span><small>MIRAR</small></div>
+    <div class="mobile-actions"><button id="mobile-interact" aria-label="Interactuar">USAR</button><button id="mobile-roll">SALTAR</button><button id="mobile-aim" aria-label="Apuntar">MIRA</button><button id="mobile-fire" class="fire-button">FUEGO</button></div>
+    <div class="touch-tools"><button id="mobile-weapon" aria-label="Cambiar arma">ARMA</button><button id="mobile-reload" aria-label="Recargar">RECARGAR</button><button id="mobile-camera" aria-label="Cambiar cámara">VISTA</button><button id="mobile-medkit" aria-label="Usar botiquín">CURAR</button></div>
+  </div>
   <div id="overlay" class="overlay hidden"><div class="overlay-card"><h1 id="overlay-title">EN PAUSA</h1><p id="overlay-copy">La ciudad seguirá en movimiento cuando regreses.</p><button id="resume">CONTINUAR</button><button id="restart">NUEVA CIUDAD</button></div></div>
 `;
 
@@ -136,6 +142,10 @@ const clock = new THREE.Clock();
 const keys = new Set<string>();
 const touchAvailable = 'ontouchstart' in window || navigator.maxTouchPoints > 0 || matchMedia('(pointer: coarse)').matches;
 app.dataset.inputMode = touchAvailable ? 'touch' : 'mouse';
+const touchMove = new TouchStick(document.querySelector<HTMLElement>('#touch-move')!, () => setInputMode('touch'));
+const touchLook = new TouchStick(document.querySelector<HTMLElement>('#touch-look')!, () => setInputMode('touch'));
+const touchAimDirection = new THREE.Vector2(0, 1);
+let touchSprint = false;
 const gamepadMove = new THREE.Vector2();
 let gamepadAim = new THREE.Vector2();
 let gamepadFireHeld = false;
@@ -177,7 +187,7 @@ function pollGamepad(): void {
     if (app.dataset.inputMode === 'gamepad') setInputMode(touchAvailable ? 'touch' : 'mouse');
     return;
   }
-  if (app.dataset.inputMode !== 'gamepad') setInputMode('gamepad', pad.id);
+
   connectedPadId = pad.id;
   const axis = (index: number): number => {
     const raw = pad.axes[index] || 0, magnitude = Math.abs(raw);
@@ -604,7 +614,7 @@ window.addEventListener('keydown', (event) => {
   if (/^Digit[1-6]$/.test(event.code)) selectWeapon(Number(event.code.slice(-1)));
 });
 window.addEventListener('keyup', (event) => keys.delete(event.code));
-window.addEventListener('blur', () => { keys.clear(); firing = false; queuedTapTime = 0; aimingDownSights = false; engine.setAiming(false); app.dataset.aiming = 'false'; });
+window.addEventListener('blur', () => { touchMove.reset(); touchLook.reset(); keys.clear(); firing = false; queuedTapTime = 0; aimingDownSights = false; engine.setAiming(false); app.dataset.aiming = 'false'; });
 $('#help-button').addEventListener('click', () => $('.controls').classList.toggle('open'));
 $('#camera-reset').addEventListener('click', () => engine.resetCamera(vehicles.heading ?? player.group.rotation.y));
 $('#camera-view').addEventListener('click', () => {
@@ -635,21 +645,30 @@ function selectWeapon(slot: number): void {
 }
 document.querySelectorAll<HTMLButtonElement>('[data-slot]').forEach((button) => button.addEventListener('click', () => selectWeapon(Number(button.dataset.slot))));
 const mobileAim = () => {
-  if (engine.mode === 'firstPerson') { aimClient = null; return screenAim(0, 0); }
-  const rect = engine.renderer.domElement.getBoundingClientRect();
-  aimClient = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-  return pickTarget(aimClient.x, aimClient.y);
+  aimClient = null; pointerTargetIsNpc = false; pointerTargetHit = null;
+  if (engine.mode === 'firstPerson' || engine.mode === 'perspective') return engine.camera.position.clone()
+    .addScaledVector(engine.camera.getWorldDirection(new THREE.Vector3()), 70);
+  return player.group.position.clone().add(new THREE.Vector3(touchAimDirection.x * 22, 1.3, touchAimDirection.y * 22));
 };
-$('#mobile-fire').addEventListener('pointerdown', (event) => { event.preventDefault(); setInputMode('touch'); firing = true; pointerAim = mobileAim(); fireAt(pointerAim); });
-$('#mobile-fire').addEventListener('pointerup', () => { firing = false; });
-$('#mobile-fire').addEventListener('pointercancel', () => { firing = false; });
-$('#mobile-aim').addEventListener('pointerdown', (event) => {
-  event.preventDefault(); setInputMode('touch'); aimingDownSights = true; engine.setAiming(true); app.dataset.aiming = 'true';
-  const rect = engine.renderer.domElement.getBoundingClientRect(); intimidateAt(rect.left + rect.width / 2, rect.top + rect.height / 2);
+function holdTouch(button: HTMLElement, press: () => void, release: () => void): void {
+  button.addEventListener('pointerdown', event => {
+    event.preventDefault();setInputMode('touch');button.setPointerCapture(event.pointerId);press();
+  });
+  button.addEventListener('pointerup', release);button.addEventListener('pointercancel', release);
+  button.addEventListener('lostpointercapture', release);
+}
+holdTouch($('#mobile-fire'), () => { firing=true;pointerAim=mobileAim();fireAt(pointerAim); }, () => {firing=false;});
+holdTouch($('#mobile-aim'), () => {
+  aimingDownSights=true;engine.setAiming(true);app.dataset.aiming='true';
+}, () => { aimingDownSights=false;engine.setAiming(false);app.dataset.aiming='false'; });
+$('#mobile-weapon').addEventListener('click', () => {
+  const slots=['fists','pistol','smg','shotgun','rifle','charge'] as const;
+  const current=slots.indexOf(inventory.weapon);
+  for(let offset=1;offset<=6;offset++)if(inventory.unlocked.has(slots[(current+offset)%6])) {
+    selectWeapon((current+offset)%6+1);break;
+  }
 });
-const releaseTouchAim = () => { aimingDownSights = false; engine.setAiming(false); app.dataset.aiming = 'false'; };
-$('#mobile-aim').addEventListener('pointerup', releaseTouchAim);
-$('#mobile-aim').addEventListener('pointercancel', releaseTouchAim);
+$('#mobile-camera').addEventListener('click', () => setCameraMode(cameraModes[(cameraModes.indexOf(engine.mode)+1)%3]));
 $('#mobile-interact').addEventListener('pointerdown', () => setInputMode('touch'));
 $('#mobile-interact').addEventListener('click', () => calmCivilians());
 $('#mobile-medkit').addEventListener('click', () => {
@@ -658,15 +677,7 @@ $('#mobile-medkit').addEventListener('click', () => {
   else notify('NO PUEDES USAR UN BOTIQUÍN AHORA');
 });
 $('#mobile-reload').addEventListener('click', () => notify(combat.startReload() ? 'RECARGANDO…' : 'NO HAY MUNICIÓN QUE RECARGAR'));
-$('#mobile-roll').addEventListener('pointerdown', (event) => { event.preventDefault(); setInputMode('touch'); keys.add('Space'); if (!vehicles.isDriving) player.jump(); });
-$('#mobile-roll').addEventListener('pointerup', () => keys.delete('Space'));
-$('#mobile-roll').addEventListener('pointercancel', () => keys.delete('Space'));
-document.querySelectorAll<HTMLButtonElement>('[data-key]').forEach((button) => {
-  const key = button.dataset.key!;
-  button.addEventListener('pointerdown', (event) => { event.preventDefault(); setInputMode('touch'); button.setPointerCapture(event.pointerId); keys.add(key); });
-  button.addEventListener('pointerup', () => keys.delete(key));
-  button.addEventListener('pointercancel', () => keys.delete(key));
-});
+holdTouch($('#mobile-roll'), () => {keys.add('Space');if(!vehicles.isDriving)player.jump();}, () => keys.delete('Space'));
 
 function updateHud(dt: number): void {
   hudTimer -= dt;
@@ -702,6 +713,20 @@ function frame(): void {
   if (document.hidden) return;
   const dt = Math.min(0.05, clock.getDelta());
   pollGamepad();
+  if (app.dataset.inputMode === 'touch' && !paused) {
+    touchSprint=touchMove.value.length()>.92;
+    if(touchLook.value.lengthSq()>.01) {
+      if(engine.mode==='isometric')touchAimDirection.copy(engine.movementVector(-touchLook.value.y,touchLook.value.x)).normalize();
+      else engine.orbit(touchLook.value.x*dt*240,touchLook.value.y*dt*210);
+    } else if(!firing && touchMove.value.lengthSq()>.01) {
+      touchAimDirection.copy(engine.movementVector(-touchMove.value.y,touchMove.value.x)).normalize();
+    }
+    pointerAim=mobileAim();if(!vehicles.isDriving&&(firing||aimingDownSights||touchLook.value.lengthSq()>.01))player.aimAt(pointerAim);
+    const reticle=$('.crosshair'), projected=pointerAim.clone().project(engine.camera);
+    reticle.style.left=engine.mode==='isometric'?`${(projected.x+1)*innerWidth/2}px`:'50%';
+    reticle.style.top=engine.mode==='isometric'?`${(1-projected.y)*innerHeight/2}px`:'50%';
+    reticle.classList.toggle('shown',firing||aimingDownSights||touchLook.value.lengthSq()>.01||engine.mode!=='isometric');
+  }
   if (gamepadAim.lengthSq() > 0.025 && !paused) {
     engine.orbit(gamepadAim.x * dt * 230, gamepadAim.y * dt * 210);
     engine.follow(player.group.position, 0, vehicles.heading, vehicles.cameraVehicle, vehicles.steeringAngle);
@@ -747,8 +772,8 @@ function frame(): void {
       citySimulationTimer = 0;
       vehicles.updateTraffic(cityDt, player);
     }
-    const forward = THREE.MathUtils.clamp(Number(keys.has('KeyW') || keys.has('ArrowUp')) - Number(keys.has('KeyS') || keys.has('ArrowDown')) - gamepadMove.y, -1, 1);
-    const right = THREE.MathUtils.clamp(Number(keys.has('KeyD') || keys.has('ArrowRight')) - Number(keys.has('KeyA') || keys.has('ArrowLeft')) + gamepadMove.x, -1, 1);
+    const forward = THREE.MathUtils.clamp(Number(keys.has('KeyW') || keys.has('ArrowUp')) - Number(keys.has('KeyS') || keys.has('ArrowDown')) - gamepadMove.y - touchMove.value.y, -1, 1);
+    const right = THREE.MathUtils.clamp(Number(keys.has('KeyD') || keys.has('ArrowRight')) - Number(keys.has('KeyA') || keys.has('ArrowLeft')) + gamepadMove.x + touchMove.value.x, -1, 1);
     const input = engine.movementVector(forward, right).clampLength(0, 1);
     if (playerRagdoll && playerKnockdownTime > 0) {
       playerKnockdownTime = Math.max(0, playerKnockdownTime - dt);
@@ -760,13 +785,13 @@ function frame(): void {
         player.group.visible = true;
       }
     } else if (vehicles.isDriving) vehicles.update(dt, {
-      forward: keys.has('KeyW') || keys.has('ArrowUp') || gamepadMove.y < -0.18 || gamepadThrottleHeld,
-      reverse: keys.has('KeyS') || keys.has('ArrowDown') || gamepadMove.y > 0.18 || gamepadReverseHeld,
-      left: keys.has('KeyA') || keys.has('ArrowLeft') || gamepadMove.x < -0.18,
-      right: keys.has('KeyD') || keys.has('ArrowRight') || gamepadMove.x > 0.18,
+      forward: keys.has('KeyW') || keys.has('ArrowUp') || gamepadMove.y < -0.18 || gamepadThrottleHeld || touchMove.value.y < -.12,
+      reverse: keys.has('KeyS') || keys.has('ArrowDown') || gamepadMove.y > 0.18 || gamepadReverseHeld || touchMove.value.y > .12,
+      left: keys.has('KeyA') || keys.has('ArrowLeft') || gamepadMove.x < -0.18 || touchMove.value.x < -.12,
+      right: keys.has('KeyD') || keys.has('ArrowRight') || gamepadMove.x > 0.18 || touchMove.value.x > .12,
       handbrake: keys.has('Space') || gamepadBrakeHeld
     }, player, engine.movementVector(0, 1));
-    else player.update(dt, input, destruction.colliders, keys.has('ShiftLeft') || keys.has('ShiftRight') || gamepadSprintHeld);
+    else player.update(dt, input, destruction.colliders, keys.has('ShiftLeft') || keys.has('ShiftRight') || gamepadSprintHeld || touchSprint);
     if (engine.mode === 'firstPerson' && document.pointerLockElement !== engine.renderer.domElement &&
         fallbackMouseInside && freeLookPoint) {
       const margin = 42;
@@ -780,6 +805,7 @@ function frame(): void {
       pointerAim = screenAim(0, 0);
       if (!vehicles.isDriving) player.aimAt(pointerAim);
     }
+    if (app.dataset.inputMode==='touch' && firing && combat.readyIn===0 && !combat.isReloading) fireAt(mobileAim());
     if ((firing || gamepadFireHeld) && (inventory.weapon === 'smg' || inventory.weapon === 'rifle')) fireAt(gamepadFireHeld ? gamepadAimTarget() : pointerAim);
     destruction.update(dt, engine.camera);
     prefabs.updateWater(dt);
@@ -805,7 +831,11 @@ function frame(): void {
       intimidationTimer -= dt;
       if (intimidationTimer <= 0) {
         intimidationTimer = 0.24;
-        if (engine.mode === 'firstPerson') intimidateAt(0, 0);
+        if(app.dataset.inputMode==='touch' && engine.mode==='isometric') {
+          const projected=mobileAim().project(engine.camera),rect=engine.renderer.domElement.getBoundingClientRect();
+          intimidateAt(rect.left+(projected.x+1)*rect.width/2,rect.top+(1-projected.y)*rect.height/2);
+        }
+        else if (engine.mode === 'firstPerson') intimidateAt(0, 0);
         else if (gamepadAimHeld) { const rect = engine.renderer.domElement.getBoundingClientRect(); intimidateAt(rect.left + rect.width / 2, rect.top + rect.height / 2); }
         else if (aimClient) intimidateAt(aimClient.x, aimClient.y);
       }
@@ -814,11 +844,17 @@ function frame(): void {
     engine.setViewWeapon(inventory.weapon, !vehicles.isDriving && !playerRagdoll && !gameOver);
     engine.updateViewWeapon(dt, player.velocity.length(), player.recoil);
     prefabs.flushFarMeshes();
+    prefabs.flushStaticDamage();
     updateHud(dt);
   }
+  npcs.renderActors();
   engine.render();
 }
 
+// Opt-in diagnostics for repeatable city/physics checks without adding HUD.
+if (new URLSearchParams(location.search).has('debug')) {
+  Object.assign(window, { __cityDebug: { engine, grid, prefabs, player, npcs, ragdolls, destruction, vehicles, setCameraMode } });
+}
 frame();
 
 window.addEventListener('beforeunload', () => { npcs.dispose(); prefabs.dispose(); engine.dispose(); });
