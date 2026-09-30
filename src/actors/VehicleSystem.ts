@@ -91,8 +91,8 @@ export class VehicleSystem {
       state.panicTime = Math.max(0, state.panicTime - dt);
       const specs = car.userData.vehicle as { maxSpeed: number };
       const fleeingSpeed = Math.min(specs.maxSpeed * 0.85, state.cruiseSpeed * 1.85);
-      state.speed = THREE.MathUtils.lerp(state.speed, state.panicTime > 0 ? fleeingSpeed : state.cruiseSpeed,
-        Math.min(1, dt * (state.panicTime > 0 ? 3 : 1.2)));
+      state.speed = THREE.MathUtils.lerp(state.speed, state.blockedTime > 0 ? 0 : state.panicTime > 0 ? fleeingSpeed : state.cruiseSpeed,
+        Math.min(1, dt * (state.blockedTime > 0 ? 6 : state.panicTime > 0 ? 3 : 1.2)));
       if (!state.turn) state.turn = this.planTurn(car, state, dt);
       if (state.turn) {
         const turn = state.turn;
@@ -109,13 +109,8 @@ export class VehicleSystem {
           other !== car && overlapsVehicle({ x, z, y:car.position.y, yaw, length: specs.length, width: specs.width }, other));
         if (blocked) {
           state.blockedTime += dt;
-          if (state.blockedTime > 2.4) {
-            // A blocked turning arc must not freeze the entire lane forever.
-            // Abandon the arc and yield by reversing along the current street.
-            state.turn = null;
-            state.direction *= -1;
-            state.blockedTime = 0;
-          }
+          // Yield on the same arc. Reversing the lane direction here caused
+          // an impossible U-turn followed by cars driving against traffic.
           continue;
         }
         state.blockedTime = 0;
@@ -141,12 +136,6 @@ export class VehicleSystem {
         state.blockedTime = 0;
       } else {
         state.blockedTime += dt;
-        if (state.blockedTime > 2.4) {
-          // Let a vehicle escape a queue or a stale turn reservation. It keeps
-          // to the road and changes direction instead of remaining parked.
-          state.direction *= -1;
-          state.blockedTime = 0;
-        }
       }
       const delta = Math.atan2(Math.sin(target - car.rotation.y), Math.cos(target - car.rotation.y));
       car.rotation.y += delta * Math.min(1, dt * 4.5);

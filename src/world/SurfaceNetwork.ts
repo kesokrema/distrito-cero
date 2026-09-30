@@ -8,6 +8,7 @@ export interface WalkSurface {
   solid?: boolean;
   navigable?:boolean;
   enabled?: (x: number, z: number) => boolean;
+  heightAt?: (x: number, z: number) => number;
 }
 /** Spatially indexed, overlapping walkable layers. Solid plazas replace ground;
  * bridges preserve a separate traversable surface beneath them. */
@@ -28,6 +29,7 @@ export class SurfaceNetwork {
       .filter(s=>x>=s.x0&&x<=s.x1&&z>=s.z0&&z<=s.z1&&s.enabled?.(x,z)!==false);
   }
   height(s:WalkSurface,x:number,z:number):number {
+    if (s.heightAt) return s.heightAt(x,z);
     const t=s.axis==='x'?(x-s.x0)/(s.x1-s.x0):(z-s.z0)/(s.z1-s.z0);
     const delta=(s.endHeight??s.height)-s.height;
     if((s.kind==='ramp'||s.kind==='stairs')&&Math.abs(delta)>0.001) {

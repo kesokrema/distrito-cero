@@ -87,7 +87,7 @@ export class UrbanLandscape {
       const accessStart=Math.max(bridgeEnd+2.2,z1-22),accessEnd=z1-4.4;
       // A parallel ramp descends beside the lower path, with no wall across its landing.
       for(const [a,c] of [[z0,accessStart],[accessEnd+2.2,z1]])if(c>a)
-        this.box(root,.44,3.52,c-a,bank+side*2.42,-1.76,(a+c)/2,'#899b86');
+        this.box(root,.22,3.52,c-a,bank+side*2.09,-1.76,(a+c)/2,'#899b86');
       this.ramp(root,{id:id+':access',kind:'ramp',x0:side<0?bank-4.4:bank+2.2,x1:side<0?bank-2.2:bank+4.4,
         z0:accessStart,z1:accessEnd,height:0,endHeight:-3.52,axis:'z',solid:true});
       // The street cutout exposes the outer side of every descending tread.
@@ -95,10 +95,10 @@ export class UrbanLandscape {
       const outerEdge=bank+side*4.4;
       const landingEnd=accessEnd+2.2;
       const retaining=this.box(root,.22,3.96,landingEnd-accessStart,
-        outerEdge+side*.11,-1.98,(accessStart+landingEnd)/2,'#899b86');
+        outerEdge-side*.11,-1.98,(accessStart+landingEnd)/2,'#899b86');
       retaining.name='canal-access-retaining-wall';
       const landingX=bank+side*3.3;
-      const corner=this.box(root,2.2,3.96,.22,landingX,-1.98,landingEnd+.11,'#899b86');
+      const corner=this.box(root,2.2,3.96,.22,landingX,-1.98,landingEnd-.11,'#899b86');
       corner.name='canal-access-corner-return';
       this.box(root,2.2,.22,2.2,landingX,-3.63,accessEnd+1.1,'#b1b4a0');
       this.grid.surfaces.add({id:id+':landing',kind:'promenade',x0:landingX-1.1,x1:landingX+1.1,z0:accessEnd,z1:accessEnd+2.2,height:-3.52,solid:true});

@@ -9,7 +9,7 @@ import { MERGED_VOXEL_OWNER, meshVoxelCells } from '../src/world/GreedyMesher';
 import { GroundPhysics,stepVehicleSuspension } from '../src/engine/GroundPhysics';
 import { SurfaceNetwork } from '../src/world/SurfaceNetwork';
 import { natureTree } from '../src/world/NaturePrefabs';
-import { meshFlatSurface,meshTerrainSurface } from '../src/world/SurfacePatches';
+import { meshFlatSurface,meshTerrainSurface,meshTerrainBanks } from '../src/world/SurfacePatches';
 import { buildingArchitecture, WALL_DIRECTIONS } from '../src/world/BuildingArchitecture';
 import { planBlock, frontageZ, frontageDirection, stairBay } from '../src/world/BuildingLayout';
 import { CITY_VOXEL_SIZE, FLOOR_HEIGHT, VOXEL_SIZE as S } from '../src/world/VoxelConstants';
@@ -579,6 +579,11 @@ test('real chunks retain precise damage, open entrances, floor coverage and boun
   for(let i=0;i<30;i++)world.flushGroundDamage();
   assert.ok(Array.from(groundChunk!.geometry.getAttribute('position').array).every(Number.isFinite), 'craters never create NaN terrain geometry');
   assert.ok(groundChunk!.geometry.getAttribute('position').array.some((value,index)=>index%3===1&&Math.abs(value-(roadHeight-CITY_VOXEL_SIZE))<1e-5), 'the road crater has real lower geometry');
+  const exposedBefore=[...roadPixels.slice(pixelIndex,pixelIndex+3)];
+  for(let blast=0;blast<20;blast++)world.scorchGround(roadX,roadZ,1);
+  const exposedAfter=[...roadPixels.slice(pixelIndex,pixelIndex+3)];
+  assert.ok(exposedAfter.every((value,channel)=>value<=exposedBefore[channel]&&value>=25),
+    'repeated scorching stays charcoal, never wraps a negative byte into white or blue');
   const canalBounds = grid.terrain.canalBounds();
   const canalX = (canalBounds.x0 + canalBounds.x1) / 2;
   const canalZ = grid.world(grid.center, grid.roadZ[4] + 4)[1];
@@ -1230,8 +1235,8 @@ test('landscape access paths stay clear, canal bridges have human clearance and 
       const x=surface.axis==='x'?surface.x0+(surface.x1-surface.x0)*t:(surface.x0+surface.x1)/2;
       const z=surface.axis==='z'?surface.z0+(surface.z1-surface.z0)*t:(surface.z0+surface.z1)/2;
       const y=grid.surfaces.height(surface,x,z);
-      assert.ok(treads.some(p=>x>=p.bounds.min.x-.001&&x<=p.bounds.max.x+.001&&
-        z>=p.bounds.min.z-.001&&z<=p.bounds.max.z+.001&&Math.abs(p.bounds.max.y-y)<.01),
+      const probe=new THREE.Raycaster(new THREE.Vector3(x,y+.01,z),new THREE.Vector3(0,-1,0),0,.02);
+      assert.ok(Number.isFinite(y)&&probe.intersectObjects(treads.map(p=>p.mesh),false).length>0,
       `${surface.id} walking height matches its voxel top at ${t}`);
       assert.equal(world.interiorObstacleAt(x,z,y),false,`blocked landscape access ${surface.id} at ${t}`);
     }
@@ -1245,7 +1250,7 @@ test('landscape access paths stay clear, canal bridges have human clearance and 
     const outerX=access.x0<grid.terrain.canalBounds().x0?access.x0:access.x1;
     const z=(access.z0+access.z1)/2;
     const wall=world.interiorPieces.find(p=>p.alive&&p.mesh.name==='canal-access-retaining-wall'&&
-      Math.abs((outerX===access.x0?p.bounds.max.x:p.bounds.min.x)-outerX)<.01&&
+      Math.abs((outerX===access.x0?p.bounds.min.x:p.bounds.max.x)-outerX)<.01&&
       p.bounds.min.z<=z&&p.bounds.max.z>=z);
     assert.ok(wall,`${access.id} has a voxel wall sealing its exterior edge`);
     assert.ok(wall.bounds.max.y>=-.01&&wall.bounds.min.y<=-3.95,
@@ -1254,7 +1259,7 @@ test('landscape access paths stay clear, canal bridges have human clearance and 
       `${access.id} outside edge has no open gap through the terrain`);
     const end=access.z1+2.2;
     const corner=world.interiorPieces.find(p=>p.alive&&p.mesh.name==='canal-access-corner-return'&&
-      p.bounds.min.z>=end-.01&&p.bounds.min.z<=end+.01&&
+      Math.abs(p.bounds.max.z-end)<.01&&
       p.bounds.min.x<=outerX+1.1&&p.bounds.max.x>=outerX-1.1);
     assert.ok(corner,`${access.id} landing corner closes against the canal bank`);
   }
@@ -1275,6 +1280,9 @@ test('landscape access paths stay clear, canal bridges have human clearance and 
   assert.ok(walker.group.position.z<promenade.z0+4,'walk through the road bridge underneath');
   assert.ok(Math.abs(walker.group.position.y-promenade.height)<.05,'never snap onto the road overhead');
   const channel=grid.terrain.canalBounds(),waterX=(channel.x0+channel.x1)/2;
+  const banks:THREE.Object3D[]=[];scene.traverse(o=>{if(o.name==='voxel-terrain-cutout-bank')banks.push(o);});
+  const underBridge=new THREE.Raycaster(new THREE.Vector3(waterX,-2,promenade.z0+grid.cellSize*3+2),new THREE.Vector3(0,0,-1),0,8);
+  assert.equal(underBridge.intersectObjects(banks,false).length,0,'earth banks leave the water passage beneath the road bridge open');
   const waterZ=promenade.z0+grid.cellSize*4;
   assert.equal(grid.water.at(waterX,waterZ),true);
   assert.equal(grid.groundHeight(waterX,waterZ),CANAL_BED_Y,'canal water has a physical floor below its visible surface');
@@ -1463,4 +1471,63 @@ test('clipped terrain omits hidden cells instead of emitting invalid triangles',
   assert.ok(surface.positions.every(Number.isFinite));
   const area=surface.indexes.length;
   assert.ok(area>6&&area<=24,'the four rectangles surround the missing voxel without a full grid');
+});
+
+test('terrain excavation banks close the union of cutouts with faces toward the excavation',()=>{
+  const cuts=[{x0:2,x1:4,z0:2,z1:6},{x0:3,x1:6,z0:4,z1:6}];
+  const surface=meshTerrainBanks(8,8,new Float32Array(64),1,0,0,()=>0,cuts,-4);
+  const geometry=new THREE.BufferGeometry();geometry.setAttribute('position',new THREE.BufferAttribute(surface.positions,3));geometry.setIndex(new THREE.BufferAttribute(surface.indexes,1));geometry.computeVertexNormals();
+  const normals=geometry.getAttribute('normal');let area=0;
+  for(let i=0;i<surface.positions.length;i+=12){
+    const a=new THREE.Vector3().fromArray(surface.positions,i),b=new THREE.Vector3().fromArray(surface.positions,i+3);
+    const edge=a.distanceTo(b);area+=edge*4;
+    const mid=a.clone().lerp(b,.5).setY(-2),normal=new THREE.Vector3().fromBufferAttribute(normals,i/3);
+    const inward=mid.clone().addScaledVector(normal,.01),outward=mid.clone().addScaledVector(normal,-.01);
+    const inside=(p:THREE.Vector3)=>cuts.some(c=>p.x>c.x0&&p.x<c.x1&&p.z>c.z0&&p.z<c.z1);
+    assert.equal(inside(inward),true,'the earth wall faces the exposed void');assert.equal(inside(outward),false,'buried interior seams are omitted');
+  }
+  assert.equal(area,64,'only the 16-unit perimeter of the cutout union has visible banks');
+  assert.ok(surface.indexes.length<=48,'coplanar bank strips are merged');
+});
+
+test('blocked traffic brakes in its lane, resumes when clear and never reverses direction',()=>{
+  const grid=new GridSystem(8402,129),block=grid.blockAt(grid.center+2,grid.center+2);
+  grid.activateBlock(block.bx,block.bz);grid.hash=()=>1;
+  const bounds=grid.blockBounds(block.bx,block.bz),direction=grid.roadDirection('x',bounds.z0+1);
+  const makeCar=(x:number)=>{const c=new THREE.Group();c.position.set(x,0,grid.roadLane('x',bounds.z0+1,direction));c.rotation.y=direction*Math.PI/2;c.userData.vehicle={length:5.28,width:2.42,maxSpeed:17,impact:1};return c;};
+  const x=grid.world(Math.round((bounds.x0+bounds.x1)/2),bounds.z0+1)[0],car=makeCar(x),blocker=makeCar(x+direction*7);
+  car.userData.autonomous=true;car.userData.trafficAxis='x';car.userData.trafficDirection=direction;
+  const prefabs={vehicles:[car,blocker],isWorldActive:()=>true,setVehicleRendered(){}} as unknown as PrefabManager;
+  const system=new VehicleSystem(prefabs,grid,new EventBus(),{nearby:()=>[]} as unknown as NPCController,{} as DestructionSystem),player={group:new THREE.Group()} as LocomotionIK;
+  const heading=car.rotation.y;
+  for(let i=0;i<240;i++)system.updateTraffic(1/30,player);
+  const state=(system as unknown as {traffic:Map<THREE.Group,{direction:number;speed:number}>}).traffic.get(car)!;
+  assert.equal(state.direction,direction);assert.ok(Math.abs(car.rotation.y-heading)<.01);assert.ok(state.speed<.1,'queued vehicles brake to a stop');
+  const stopped=car.position.x;prefabs.vehicles.splice(1,1);
+  for(let i=0;i<45;i++)system.updateTraffic(1/30,player);
+  assert.ok((car.position.x-stopped)*direction>2,'the queue resumes forward once the obstacle leaves');
+});
+
+test('damaged outdoor stairs support their surviving column and full destruction leaves rendered earth',()=>{
+  Object.assign(globalThis,{Worker:MeshWorker});
+  const grid=new GridSystem(470943),scene=new THREE.Scene(),world=new PrefabManager(scene,grid),block=grid.blockAt(grid.center,grid.center);
+  world.ensureAround(grid.terrain.canalColumn,block.bz,0,Infinity);drain(world);scene.updateMatrixWorld(true);
+  const surface=[...grid.surfaces.surfaces.values()].find(s=>s.id.startsWith('riverwalk:')&&s.id.endsWith(':access'))!;
+  const piece=world.interiorPieces.find(p=>p.alive&&p.mesh.userData.walkSurfaceIds?.includes(surface.id)&&p.dimensions.ny>5)!;
+  const center=world.sceneVoxelPosition(piece,Math.floor(piece.dimensions.nx/2)+piece.dimensions.nx*(Math.floor(piece.dimensions.nz/2)+piece.dimensions.nz*(piece.dimensions.ny-1)));
+  const before=grid.surfaces.height(surface,center.x,center.z);
+  const {nx,ny,nz}=piece.dimensions;const ix=Math.floor(nx/2),iz=Math.floor(nz/2),sub=ix+nx*(iz+nz*(ny-1));
+  world.eraseSceneVoxels(piece,[sub]);world.flushStaticDamage();
+  assert.ok(Math.abs(grid.surfaces.height(surface,center.x,center.z)-(before-S))<1e-5,'support follows the next remaining voxel below the damaged tread');
+  const feet=world.supportHeight(center.x,center.z,before);
+  assert.ok(Math.abs(feet-(before-S))<1e-5,'physics receives the same exposed tread height');
+  for(const p of world.interiorPieces.filter(p=>p.mesh.userData.walkSurfaceIds?.includes(surface.id)))world.eraseSceneVoxels(p,Array.from(p.mask.keys()));
+  for(let i=0;i<50;i++)world.flushStaticDamage();
+  assert.equal(grid.surfaces.at(center.x,center.z).some(s=>s.id===surface.id),false,'a fully removed tread no longer supports the body');
+  const ray=new THREE.Raycaster(new THREE.Vector3(center.x,1,center.z),new THREE.Vector3(0,-1,0));
+  const earth:THREE.Object3D[]=[];scene.traverse(o=>{if(o instanceof THREE.Mesh&&o.userData.terrainFoundation)earth.push(o);});
+  const hit=ray.intersectObjects(earth,false)[0];assert.ok(hit,'the floor beneath the destroyed ramp stays rendered');
+  assert.ok(Math.abs(hit.point.y-world.supportHeight(center.x,center.z,before))<1e-5,'rendered earth and the fallback collision height agree');
+  assert.ok(earth.some(o=>o.name==='voxel-terrain-cutout-bank'),'excavations have closed voxel earth banks behind the destructible wall');
+  world.dispose();
 });

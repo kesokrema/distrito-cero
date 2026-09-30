@@ -12,7 +12,7 @@ import { buildingArchitecture, WALL_DIRECTIONS } from './BuildingArchitecture';
 import { createHumanoid } from '../actors/HumanoidModel';
 import { MERGED_VOXEL_OWNER } from './GreedyMesher';
 import { meshVoxelCells } from './GreedyMesher';
-import { meshTerrainSurface } from './SurfacePatches';
+import { meshTerrainSurface, meshTerrainBanks } from './SurfacePatches';
 import { animateCanalFlow, CANAL_BED_Y, CANAL_SURFACE_Y } from './CanalWater';
 import { meshVoxelDecorations, snapVoxelMeshToGrid } from './VoxelDecorationMesher';
 import { createRoofFeatureMesh, type RoofVoxel } from './RoofPrefabRenderer';
@@ -283,7 +283,10 @@ export class PrefabManager {
 
   toggleGround(): boolean {
     this.groundVisible = !this.groundVisible;
-    for (const tiles of this.groundTiles) tiles.visible = this.groundVisible;
+    for (const tiles of this.groundTiles) {
+      tiles.visible = this.groundVisible;
+      if(tiles.userData.terrainBank)tiles.userData.terrainBank.visible=this.groundVisible;
+    }
     return this.groundVisible;
   }
 
@@ -698,7 +701,10 @@ export class PrefabManager {
         for(const id of object.userData.walkSurfaceIds??[]) {
           const surface=this.grid.surfaces.surfaces.get(id),pieces=this.walkSurfacePieces.get(id)??[];
           pieces.push(piece);this.walkSurfacePieces.set(id,pieces);
-          if(surface)surface.enabled=(x,z)=>pieces.some(p=>p.alive&&this.pieceOccupies(p,x,this.grid.surfaces.height(surface,x,z)-VOXEL_SIZE/2,z));
+          if(surface) {
+            surface.heightAt=(x,z)=>{let top=-Infinity;for(const p of pieces)top=Math.max(top,this.pieceTopAt(p,x,z));return top;};
+            surface.enabled=(x,z)=>Number.isFinite(surface.heightAt!(x,z));
+          }
         }
         const cell = this.grid.cellAtWorld(piece.center.x, piece.center.z);
         if (!cell) return;
@@ -872,10 +878,23 @@ export class PrefabManager {
             layer.heights[ix+iz*layer.width]=-CITY_VOXEL_SIZE;
           }
         this.dirtyGround.add(ground);
+        const bounds=ground.userData.groundBounds as {x0:number;z0:number;width:number;depth:number;size:number};
+        const ix=Math.floor((cx-bounds.x0)/bounds.size),iz=Math.floor((cz-bounds.z0)/bounds.size);
+        if(ix>=0&&iz>=0&&ix<bounds.width&&iz<bounds.depth) {
+          const at=(ix+iz*bounds.width)*4;
+          const basePixels=ground.userData.groundBasePixels as Uint8Array;
+          const pixels=ground.userData.groundPixels as Uint8Array;
+          // The painted road marking belonged to the removed asphalt voxel.
+          // Exposed material has asphalt tones rather than white zebra stripes.
+          const shade=.94+this.grid.hash(vx,vz,732)*.04;
+          for(const [channel,value] of [66,82,93].entries())basePixels[at+channel]=Math.round(value*shade);
+          const soot=ground.userData.groundSoot as Float32Array;
+          for(let channel=0;channel<3;channel++)pixels[at+channel]=Math.round(basePixels[at+channel]*(1-soot[ix+iz*bounds.width]));
+        }
       }
     }
     const centerX = vx * size, centerZ = vz * size;
-    const strength = health <= 0 ? 0.96 : 0.28 + (1 - health / 1.55) * 0.42;
+    const strength = health <= 0 ? 0.28 : 0.12 + (1 - health / 1.55) * 0.16;
     const mark = { x: centerX, z: centerZ, radius: size * (health <= 0 ? 0.36 : 0.24), strength };
     this.groundMarks.push(mark);
     if (this.groundMarks.length > 256) this.groundMarks.shift();
@@ -894,6 +913,30 @@ export class PrefabManager {
         if(piece.bounds.min.y<=base+.08&&piece.bounds.max.y>=base-.001)this.dirtyGround.add(ground);
       }
     }
+  }
+
+  private updateTerrainBanks(ground:THREE.Mesh):void {
+    const layer=ground.userData.groundLayer as GroundLayer;
+    if(!layer.cutouts.length)return;
+    const canal=this.grid.terrain.canalBounds();
+    const surface=meshTerrainBanks(layer.width,layer.depth,layer.heights,layer.size,layer.x0,layer.z0,
+      (x,z)=>this.grid.terrain.height(x,z),layer.cutouts,(x,z)=>
+        x>=canal.x0-2.2&&x<=canal.x1+2.2&&!this.grid.terrain.cutoutAt(x,z)
+          ?this.grid.terrain.height(x,z)-CITY_VOXEL_SIZE:CANAL_BED_Y-VOXEL_SIZE*2);
+    let bank=ground.userData.terrainBank as THREE.Mesh|undefined;
+    if(!bank&&!surface.indexes.length)return;
+    if(!bank) {
+      bank=new THREE.Mesh(new THREE.BufferGeometry(),voxelDecorationMaterial);
+      bank.name='voxel-terrain-cutout-bank';bank.userData.terrainFoundation=true;
+      bank.receiveShadow=true;ground.userData.terrainBank=bank;this.scene.add(bank);
+    }
+    const geometry=new THREE.BufferGeometry(),paint=new THREE.Color('#998b6c');
+    geometry.setAttribute('position',new THREE.BufferAttribute(surface.positions,3));
+    const colors=new Float32Array(surface.positions.length);
+    for(let i=0;i<colors.length;i+=3){colors[i]=paint.r;colors[i+1]=paint.g;colors[i+2]=paint.b;}
+    geometry.setAttribute('color',new THREE.BufferAttribute(colors,3));
+    geometry.setIndex(new THREE.BufferAttribute(surface.indexes,1));geometry.computeVertexNormals();geometry.computeBoundingSphere();
+    bank.geometry.dispose();bank.geometry=geometry;bank.visible=this.groundVisible&&surface.indexes.length>0;
   }
 
   flushGroundDamage(): void {
@@ -947,6 +990,7 @@ export class PrefabManager {
       geometry.setIndex(indexes);geometry.computeVertexNormals();geometry.computeBoundingSphere();
       geometry.userData.surfaceStats={cells:layer.width*layer.depth/(VOXELS_PER_CELL*VOXELS_PER_CELL),quads:indexes.length/6};
       ground.geometry.dispose();ground.geometry=geometry;
+      this.updateTerrainBanks(ground);
       this.dirtyGround.delete(ground);
       if(performance.now()>=deadline)break;
     }
@@ -967,9 +1011,13 @@ export class PrefabManager {
       const distance = Math.hypot(worldX - mark.x, worldZ - mark.z) / mark.radius;
       if (distance >= 1) continue;
       const grain = this.grid.hash(Math.floor(worldX / bounds.size), Math.floor(worldZ / bounds.size), 731);
-      const soot = Math.max(0, 1 - distance * distance) * (mark.strength + grain * 0.08);
+      const soot = Math.min(.42, Math.max(0, 1 - distance * distance) * (mark.strength + grain * 0.04));
       const at = (iz * bounds.width + ix) * 4;
-      for (let channel = 0; channel < 3; channel++) pixels[at + channel] = Math.round(pixels[at + channel] * (1 - soot));
+      const basePixels=ground.userData.groundBasePixels as Uint8Array;
+      const darkening=ground.userData.groundSoot as Float32Array;
+      const pixel=iz*bounds.width+ix;
+      darkening[pixel]=Math.max(darkening[pixel],soot);
+      for (let channel = 0; channel < 3; channel++) pixels[at + channel] = Math.round(basePixels[at + channel] * (1 - darkening[pixel]));
     }
     const material = ground.material as THREE.MeshStandardMaterial;
     if (material.map) material.map.needsUpdate = true;
@@ -1226,6 +1274,9 @@ export class PrefabManager {
         state.mesh.geometry.dispose(); state.mesh.geometry = geometry;
         state.mesh.material = voxelDecorationMaterial;
         state.mesh.visible = Boolean(surface.indexes.length);
+      } else {
+        state.mesh.visible=false;
+        state.mesh.geometry.dispose();state.mesh.geometry=new THREE.BufferGeometry();
       }
       this.dirtyAggregates.delete(state);
       if (performance.now() >= deadline) break;
@@ -1338,10 +1389,13 @@ export class PrefabManager {
     ground.userData.groundLayer = { size: VOXEL_SIZE, heights: fineHeights, hidden: new Uint8Array(fineWidth*fineDepth), width:fineWidth, depth:fineDepth,
       x0:firstX-this.grid.cellSize/2,z0:firstZ-this.grid.cellSize/2,cutouts } satisfies GroundLayer;
     ground.userData.groundPixels = pixels;
+    ground.userData.groundBasePixels = pixels.slice();
+    ground.userData.groundSoot = new Float32Array(width*depth);
     ground.userData.groundBounds = { x0: firstX - this.grid.cellSize / 2, z0: firstZ - this.grid.cellSize / 2,
       width, depth, size: CITY_VOXEL_SIZE };
     for (const mark of this.groundMarks) this.paintGroundMark(ground, mark);
     this.groundTiles.push(ground); this.scene.add(ground);
+    this.updateTerrainBanks(ground);
     if (edges.length) {
       const curbs = new THREE.InstancedMesh(this.curbGeometry, this.tileMaterial, edges.length);
       for (let i = 0; i < edges.length; i++) {
@@ -1604,6 +1658,21 @@ export class PrefabManager {
     return ix >= 0 && ix < nx && iy >= 0 && iy < ny && iz >= 0 && iz < nz && !!piece.mask[ix + nx * (iz + nz * iy)];
   }
 
+  /** The surviving voxel column owns the contact height, including a tread
+   * whose top was removed but whose lower voxels are still solid. */
+  private pieceTopAt(piece:InteriorPiece,x:number,z:number):number {
+    if(!piece.alive||x<piece.bounds.min.x||x>=piece.bounds.max.x||z<piece.bounds.min.z||z>=piece.bounds.max.z)return -Infinity;
+    const {nx,ny,nz}=piece.dimensions,size=piece.dimensions.voxelSize??VOXEL_SIZE;
+    const point=this.occupancyProbe.set(x,piece.center.y,z).applyMatrix4(piece.inverseWorld??piece.mesh.matrixWorld.clone().invert());
+    const ix=Math.floor(point.x/size+nx/2),iz=Math.floor(point.z/size+nz/2);
+    if(ix<0||ix>=nx||iz<0||iz>=nz)return -Infinity;
+    for(let iy=ny-1;iy>=0;iy--)if(piece.mask[ix+nx*(iz+nz*iy)]) {
+      point.set((ix-(nx-1)/2)*size,(iy-(ny-1)/2)*size,(iz-(nz-1)/2)*size).applyMatrix4(piece.mesh.matrixWorld);
+      return point.y+size/2;
+    }
+    return -Infinity;
+  }
+
   preparePieceDamage(piece: InteriorPiece): void {
     if (piece.ownsState) return;
     piece.health = piece.health.slice(); piece.mask = piece.mask.slice(); piece.ownsState = true;
@@ -1831,7 +1900,9 @@ export class PrefabManager {
         }
         const tread = stairs.steps[level]?.[stepIndex];
         if (!tread || this.interiorPieceByMesh.get(tread)?.alive === false) continue;
-        const height = this.interiorPieceByMesh.get(tread)?.bounds.max.y ?? stairs.position.y + (level + (stepIndex+1)/stairs.treadCount) * stairs.storeyHeight;
+        const piece=this.interiorPieceByMesh.get(tread);
+        const height = piece ? this.pieceTopAt(piece,x,z) : stairs.position.y + (level + (stepIndex+1)/stairs.treadCount) * stairs.storeyHeight;
+        if(!Number.isFinite(height))continue;
         const distance = Math.abs(currentY - height);
         if (distance <= 0.52 && distance < bestDistance) { best = { height, room: stairs.room }; bestDistance = distance; }
       }
