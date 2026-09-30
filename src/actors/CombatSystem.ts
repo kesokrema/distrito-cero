@@ -193,7 +193,7 @@ export class CombatSystem {
         if (index !== null && piece !== null) this.destruction.damageVoxel(index, damage * 0.75, piece);
       } else if (groundHit) {
         end.copy(groundHit.point);
-        this.destruction.damageRoadSurface(groundHit.point.x, groundHit.point.z, damage * 0.75);
+        this.destruction.damagePavementSurface(groundHit.point.x, groundHit.point.z, damage * 0.75);
       }
       this.launchBulletParticle(visualMuzzle, end);
     }

@@ -278,10 +278,14 @@ export class GridSystem {
     }
     return {indexes:Uint32Array.from(indexes),blocked:Uint8Array.from(blocked),heights:Float32Array.from(heights),costs:Uint8Array.from(costs)};
   }
-  readonly roadSurfaceDepth = new Map<string, number>();
+  readonly pavementSurfaceDepth = new Map<string, number>();
+  pavementOffset(x:number,z:number):number {
+    const cell=this.cellAtWorld(x,z);
+    return cell?.tile==='sidewalk' ? .07 : 0;
+  }
   pavementHeight(x:number,z:number):number {
     const key = `${Math.floor((x + CITY_VOXEL_SIZE / 2) / CITY_VOXEL_SIZE)}:${Math.floor((z + CITY_VOXEL_SIZE / 2) / CITY_VOXEL_SIZE)}`;
-    return this.terrain.height(x,z) - (this.roadSurfaceDepth.get(key) ?? 0);
+    return this.terrain.height(x,z) + this.pavementOffset(x,z) - (this.pavementSurfaceDepth.get(key) ?? 0);
   }
   groundHeight(x:number,z:number):number {
     return this.surfaces.ground(x,z,this.terrain.waterAt(x,z)?CANAL_BED_Y:this.pavementHeight(x,z));

@@ -572,7 +572,7 @@ test('real chunks retain precise damage, open entrances, floor coverage and boun
   const pixelIndex = (Math.floor((roadZ - groundBounds.z0) / groundBounds.size) * groundBounds.width +
     Math.floor((roadX - groundBounds.x0) / groundBounds.size)) * 4;
   const roadPixelBefore = [...roadPixels.slice(pixelIndex, pixelIndex + 3)];
-  assert.equal(collisionDamage.damageRoadSurface(roadX, roadZ, 3), true, 'street surface accepts projectile damage');
+  assert.equal(collisionDamage.damagePavementSurface(roadX, roadZ, 3), true, 'street surface accepts projectile damage');
   assert.notDeepEqual([...roadPixels.slice(pixelIndex, pixelIndex + 3)], roadPixelBefore,
     'the damaged voxel surface is visibly replaced by a darker exposed layer');
   assert.equal(grid.groundHeight(roadX, roadZ), roadHeight-CITY_VOXEL_SIZE, 'the destroyed road layer reveals a lower solid support');
@@ -584,11 +584,32 @@ test('real chunks retain precise damage, open entrances, floor coverage and boun
   const exposedAfter=[...roadPixels.slice(pixelIndex,pixelIndex+3)];
   assert.ok(exposedAfter.every((value,channel)=>value<=exposedBefore[channel]&&value>=25),
     'repeated scorching stays charcoal, never wraps a negative byte into white or blue');
+  const sidewalk=grid.activeCells.find(c=>c.tile==='sidewalk'&&!c.blocked&&
+    !grid.surfaces.at(...grid.world(c.x,c.z)).length&&
+    [[-1,0],[1,0],[0,-1],[0,1]].some(([dx,dz])=>grid.cell(c.x+dx,c.z+dz)?.active&&grid.cell(c.x+dx,c.z+dz)?.tile==='road'))!;
+  assert.ok(sidewalk,'the neighborhood has ordinary paving beside the asphalt');
+  const [walkX,walkZ]=grid.world(sidewalk.x,sidewalk.z),walkHeight=grid.groundHeight(walkX,walkZ);
+  const sidewalkMeshes=world.groundMeshesNear(walkX,walkZ,.1);
+  const sidewalkProbe=new THREE.Raycaster(new THREE.Vector3(walkX,walkHeight+1,walkZ),new THREE.Vector3(0,-1,0));
+  assert.ok(Math.abs(sidewalkProbe.intersectObjects(sidewalkMeshes,false)[0].point.y-walkHeight)<1e-5,'intact paving and collision height agree');
+  const [dx,dz]=[[-1,0],[1,0],[0,-1],[0,1]].find(([dx,dz])=>grid.cell(sidewalk.x+dx,sidewalk.z+dz)?.active&&grid.cell(sidewalk.x+dx,sidewalk.z+dz)?.tile==='road')!;
+  const edgeX=walkX+dx*grid.cellSize/2,edgeZ=walkZ+dz*grid.cellSize/2;
+  const curbProbe=new THREE.Raycaster(new THREE.Vector3(edgeX+dx*.15,walkHeight-.035,edgeZ+dz*.15),new THREE.Vector3(-dx,0,-dz),0,.3);
+  const edgeMeshes=world.groundMeshesNear(edgeX,edgeZ,1);
+  assert.ok(curbProbe.intersectObjects(edgeMeshes,false).length,'the intact sidewalk edge has a visible riser');
+  assert.equal(collisionDamage.damagePavementSurface(walkX,walkZ,3),true,'sidewalk voxels accept projectile damage');
+  for(let i=0;i<30;i++)world.flushGroundDamage();
+  assert.ok(Math.abs(grid.groundHeight(walkX,walkZ)-(walkHeight-CITY_VOXEL_SIZE))<1e-5,'paving reveals exactly one lower support layer');
+  assert.ok(Math.abs(sidewalkProbe.intersectObjects(sidewalkMeshes,false)[0].point.y-grid.groundHeight(walkX,walkZ))<1e-5,'destroyed paving stays closed and matches physics');
+  collisionDamage.blast(edgeX,edgeZ,1.4,'player',walkHeight+.2);
+  for(let i=0;i<30;i++)world.flushGroundDamage();
+  assert.equal(curbProbe.intersectObjects(edgeMeshes,false).length,0,'an explosion retires the curb with the adjoining pavement');
+  assert.ok(Math.abs(grid.groundHeight(walkX,walkZ)-(walkHeight-CITY_VOXEL_SIZE))<1e-5,'repeated damage cannot dig beyond the protected foundation');
   const canalBounds = grid.terrain.canalBounds();
   const canalX = (canalBounds.x0 + canalBounds.x1) / 2;
   const canalZ = grid.world(grid.center, grid.roadZ[4] + 4)[1];
   if (grid.terrain.waterAt(canalX, canalZ)) {
-    assert.equal(collisionDamage.damageRoadSurface(canalX, canalZ, 3), false, 'canal water cannot be damaged as a road voxel');
+    assert.equal(collisionDamage.damagePavementSurface(canalX, canalZ, 3), false, 'canal water cannot be damaged as a road voxel');
   }
   const vehiclePiece = world.vehicleDamageParts(vehicle)[0];
   const initialVoxels = vehiclePiece.mask.reduce((sum, value) => sum + value, 0);

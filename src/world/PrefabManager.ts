@@ -192,13 +192,11 @@ export class PrefabManager {
   private readonly dirtyAggregates = new Set<{ mesh: THREE.Mesh; pieces: InteriorPiece[] }>();
   private voxelsByCell = new Map<number, number[]>();
   private entranceApproaches = new Set<number>();
-  private curbGeometry = new THREE.PlaneGeometry(VOXEL_SIZE, 0.07);
-  private tileMaterial = new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 1 });
   private groundTiles: THREE.Mesh[] = [];
   readonly lightAnchors: CityLightAnchor[] = [];
   readonly overlapRemovals = { shell: 0, static: 0 };
   private readonly groundMarks: GroundMark[] = [];
-  private readonly damagedRoadVoxels = new Map<string, number>();
+  private readonly damagedPavementVoxels = new Map<string, number>();
   private groundVisible = true;
   private readonly dirtyGround = new Set<THREE.Mesh>();
   private meshWorker: Worker;
@@ -256,8 +254,6 @@ export class PrefabManager {
                                    1.0 + tone,
                                    1.0 + tone - warm * 0.05 * detail);`);
     };
-    // Ground only needs its exposed surface; curbs retain the raised sidewalk edge.
-    this.curbGeometry = new THREE.PlaneGeometry(grid.cellSize, 0.07);
     this.meshWorker = new Worker(new URL('../workers/mesh.worker.ts', import.meta.url), { type: 'module' });
     this.meshWorker.onmessage = (event: MessageEvent<FarMeshResult>) => this.receiveFarMesh(event.data);
     scene.add(this.buildings);
@@ -849,33 +845,31 @@ export class PrefabManager {
     for (const ground of this.groundTiles) this.paintGroundMark(ground, mark);
   }
 
-  /** Damage one road-surface voxel. The terrain datum beneath it stays solid,
-   * so the road can be scarred without opening holes into canals or slopes. */
-  damageRoadSurface(x: number, z: number, amount: number): THREE.Color | null {
+  /** Retire one asphalt or paving voxel while retaining a solid lower layer. */
+  damagePavementSurface(x: number, z: number, amount: number): THREE.Color | null {
     const cell = this.grid.cellAtWorld(x, z);
-    if (!cell?.active || cell.tile !== 'road' || this.grid.terrain.waterAt(x, z)) return null;
-    const base = this.grid.terrain.height(x, z);
-    // Raised decks, ramps and stairs own their own destructible surface. Never
-    // let a road shot punch through their height layer or alter the terrain.
+    if (!cell?.active || (cell.tile !== 'road' && cell.tile !== 'sidewalk') || this.grid.terrain.waterAt(x, z)) return null;
+    // Prefab decks, ramps and stairs own their own destructible surface.
+    // Their cutouts must never acquire a second pavement layer.
     for (const surface of this.grid.surfaces.surfaces.values()) {
-      if (!surface.solid || surface.height <= base + 0.18) continue;
+      if (!surface.solid) continue;
       if (x >= surface.x0 && x <= surface.x1 && z >= surface.z0 && z <= surface.z1) return null;
     }
     const size = CITY_VOXEL_SIZE;
     const vx = Math.floor((x + size / 2) / size), vz = Math.floor((z + size / 2) / size);
     const key = `${vx}:${vz}`;
-    const health = Math.max(0, (this.damagedRoadVoxels.get(key) ?? 1.55) - Math.max(0, amount));
-    if (health <= 0 && this.grid.roadSurfaceDepth.has(key)) return null;
-    this.damagedRoadVoxels.set(key, health);
+    const health = Math.max(0, (this.damagedPavementVoxels.get(key) ?? 1.55) - Math.max(0, amount));
+    if (health <= 0 && this.grid.pavementSurfaceDepth.has(key)) return null;
+    this.damagedPavementVoxels.set(key, health);
     if (health <= 0) {
-      this.grid.roadSurfaceDepth.set(key, CITY_VOXEL_SIZE);
+      this.grid.pavementSurfaceDepth.set(key, CITY_VOXEL_SIZE);
       for (const ground of this.groundMeshesNear(x, z, CITY_VOXEL_SIZE)) {
         const layer = ground.userData.groundLayer as GroundLayer;
         const cx=vx*size,cz=vz*size;
         for(let iz=Math.floor((cz-size/2-layer.z0)/layer.size);iz<Math.round((cz+size/2-layer.z0)/layer.size);iz++)
           for(let ix=Math.floor((cx-size/2-layer.x0)/layer.size);ix<Math.round((cx+size/2-layer.x0)/layer.size);ix++) {
             if(ix<0||iz<0||ix>=layer.width||iz>=layer.depth)continue;
-            layer.heights[ix+iz*layer.width]=-CITY_VOXEL_SIZE;
+            layer.heights[ix+iz*layer.width]=this.grid.pavementOffset(vx*size,vz*size)-CITY_VOXEL_SIZE;
           }
         this.dirtyGround.add(ground);
         const bounds=ground.userData.groundBounds as {x0:number;z0:number;width:number;depth:number;size:number};
@@ -884,10 +878,11 @@ export class PrefabManager {
           const at=(ix+iz*bounds.width)*4;
           const basePixels=ground.userData.groundBasePixels as Uint8Array;
           const pixels=ground.userData.groundPixels as Uint8Array;
-          // The painted road marking belonged to the removed asphalt voxel.
-          // Exposed material has asphalt tones rather than white zebra stripes.
+          // Retired asphalt loses its marking; retired paving exposes warm
+          // aggregate rather than inheriting the street material.
           const shade=.94+this.grid.hash(vx,vz,732)*.04;
-          for(const [channel,value] of [66,82,93].entries())basePixels[at+channel]=Math.round(value*shade);
+          const exposed=cell.tile==='road'?[66,82,93]:[170,160,140];
+          for(const [channel,value] of exposed.entries())basePixels[at+channel]=Math.round(value*shade);
           const soot=ground.userData.groundSoot as Float32Array;
           for(let channel=0;channel<3;channel++)pixels[at+channel]=Math.round(basePixels[at+channel]*(1-soot[ix+iz*bounds.width]));
         }
@@ -899,7 +894,7 @@ export class PrefabManager {
     this.groundMarks.push(mark);
     if (this.groundMarks.length > 256) this.groundMarks.shift();
     for (const ground of this.groundTiles) this.paintGroundMark(ground, mark);
-    return new THREE.Color(health <= 0 ? '#27323a' : '#42525d');
+    return new THREE.Color(cell.tile==='sidewalk' ? '#aaa08c' : health <= 0 ? '#27323a' : '#42525d');
   }
 
   private clipGroundToStaticVoxels(firstPiece: number): void {
@@ -962,28 +957,42 @@ export class PrefabManager {
       const result = meshTerrainSurface(layer.width, layer.depth, heights, layer.size, layer.x0, layer.z0,
         (x,z) => this.grid.terrain.height(x,z), () => false, layer.cutouts);
       const positions = Array.from(result.positions), uvs = Array.from(result.uvs), indexes = Array.from(result.indexes);
-      // Emit the exposed risers of the remaining asphalt, so a crater has real
-      // thickness and never exposes the empty background below the terrain.
+      type Riser={a:number[];b:number[];lowA:number;lowB:number;highA:number;highB:number;dx:number;dz:number};
+      const risers=new Map<string,Riser>();
+      const emitRiser=(r:Riser)=>{
+        const first=positions.length/3;
+        positions.push(r.a[0],r.lowA,r.a[1],r.b[0],r.lowB,r.b[1],r.b[0],r.highB,r.b[1],r.a[0],r.highA,r.a[1]);
+        for(const point of [r.a,r.b,r.b,r.a])uvs.push(
+          (point[0]-r.dx*layer.size/2-layer.x0)/(layer.width*layer.size),
+          (point[1]-r.dz*layer.size/2-layer.z0)/(layer.depth*layer.size));
+        if(r.dx===1||r.dz===-1)indexes.push(first,first+1,first+2,first,first+2,first+3);
+        else indexes.push(first,first+2,first+1,first,first+3,first+2);
+      };
+      // The same height field owns crater walls and sidewalk edges. No
+      // separate curb mesh can survive after the paving below it is removed.
       for (let z = 0; z < layer.depth; z++) for (let x = 0; x < layer.width; x++) {
         const height = heights[x + z * layer.width];
-        if (!Number.isFinite(height) || height >= 0) continue;
+        if (!Number.isFinite(height)) continue;
         const x0 = layer.x0 + x * layer.size, z0 = layer.z0 + z * layer.size;
         for (const [dx,dz] of [[-1,0],[1,0],[0,-1],[0,1]]) {
           const nx = x+dx, nz = z+dz;
-          if (nx < 0 || nz < 0 || nx >= layer.width || nz >= layer.depth) continue;
-          const top = heights[nx + nz * layer.width];
+          const wx=layer.x0+(nx+.5)*layer.size,wz=layer.z0+(nz+.5)*layer.size;
+          if(layer.cutouts.some(c=>wx>c.x0&&wx<c.x1&&wz>c.z0&&wz<c.z1))continue;
+          const top = nx < 0 || nz < 0 || nx >= layer.width || nz >= layer.depth
+            ?this.grid.pavementHeight(wx,wz)-this.grid.terrain.height(wx,wz):heights[nx+nz*layer.width];
           if (!Number.isFinite(top) || top <= height) continue;
           const a = dx ? [x0+(dx>0?layer.size:0), z0] : [x0,z0+(dz>0?layer.size:0)];
           const b = dx ? [a[0],z0+layer.size] : [x0+layer.size,a[1]];
-          const first=positions.length/3;
           const ea=this.grid.terrain.height(a[0],a[1]),eb=this.grid.terrain.height(b[0],b[1]);
-          positions.push(a[0],ea+height,a[1],b[0],eb+height,b[1],b[0],eb+top,b[1],a[0],ea+top,a[1]);
-          for (let i=0;i<4;i++) uvs.push((x+.5)/layer.width,(z+.5)/layer.depth);
-          // Walls face into the removed voxel.
-          if(dx===1||dz===-1)indexes.push(first,first+1,first+2,first,first+2,first+3);
-          else indexes.push(first,first+2,first+1,first,first+3,first+2);
+          const riser:Riser={a,b,lowA:ea+height,lowB:eb+height,highA:ea+top,highB:eb+top,dx,dz};
+          if(Math.abs(ea-eb)>1e-5){emitRiser(riser);continue;}
+          const key=`${dx}:${dz}:${(dx?a[0]:a[1]).toFixed(5)}:${riser.lowA.toFixed(5)}:${riser.highA.toFixed(5)}`;
+          const previous=risers.get(key);
+          if(previous&&Math.hypot(previous.b[0]-a[0],previous.b[1]-a[1])<1e-5)previous.b=b;
+          else {if(previous)emitRiser(previous);risers.set(key,riser);}
         }
       }
+      for(const riser of risers.values())emitRiser(riser);
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));
       geometry.setAttribute('uv',new THREE.Float32BufferAttribute(uvs,2));
@@ -1326,7 +1335,6 @@ export class PrefabManager {
     };
     const cellWidth = bounds.x1 - bounds.x0, cellDepth = bounds.z1 - bounds.z0;
     const heights = new Float32Array(cellWidth * cellDepth).fill(NaN);
-    const edges: Array<{ x: number; z: number; dx: number; dz: number }> = [];
     for (const cell of cells) {
       const [x, z] = this.grid.world(cell.x, cell.z);
       const cx = (cell.x - bounds.x0) * CITY_VOXELS_PER_CELL, cz = (cell.z - bounds.z0) * CITY_VOXELS_PER_CELL;
@@ -1355,10 +1363,7 @@ export class PrefabManager {
         const at = ((cz + iz) * width + cx + ix) * 4;
         pixels[at] = Math.min(255, rgb.r * 255 * tone); pixels[at + 1] = Math.min(255, rgb.g * 255 * tone); pixels[at + 2] = Math.min(255, rgb.b * 255 * tone); pixels[at + 3] = 255;
       }
-      heights[(cell.z - bounds.z0) * cellWidth + cell.x - bounds.x0] = cell.tile === 'road' ? 0 : 0.07;
-      if (cell.tile !== 'road') for (const [dx, dz] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
-        if (this.grid.cell(cell.x + dx, cell.z + dz)?.tile === 'road') edges.push({ x, z, dx, dz });
-      }
+      heights[(cell.z - bounds.z0) * cellWidth + cell.x - bounds.x0] = cell.tile === 'road' ? 0 : .07;
     }
     const texture = new THREE.DataTexture(pixels, width, depth);
     texture.colorSpace = THREE.SRGBColorSpace; texture.magFilter = THREE.NearestFilter;
@@ -1396,17 +1401,7 @@ export class PrefabManager {
     for (const mark of this.groundMarks) this.paintGroundMark(ground, mark);
     this.groundTiles.push(ground); this.scene.add(ground);
     this.updateTerrainBanks(ground);
-    if (edges.length) {
-      const curbs = new THREE.InstancedMesh(this.curbGeometry, this.tileMaterial, edges.length);
-      for (let i = 0; i < edges.length; i++) {
-        const { x, z, dx, dz } = edges[i];
-        this.dummy.position.set(x + dx * this.grid.cellSize / 2, this.grid.terrain.height(x + dx * this.grid.cellSize / 2,z + dz * this.grid.cellSize / 2) + 0.035, z + dz * this.grid.cellSize / 2);
-        this.dummy.rotation.set(0, dx ? dx * Math.PI / 2 : dz > 0 ? 0 : Math.PI, 0);
-        this.dummy.scale.setScalar(1); this.dummy.updateMatrix(); curbs.setMatrixAt(i, this.dummy.matrix);
-      }
-      curbs.receiveShadow = true; curbs.visible = this.groundVisible;
-      this.groundTiles.push(curbs); this.scene.add(curbs);
-    }
+    this.dirtyGround.add(ground);
   }
 
   /** Reserve entrances before any street or courtyard props are placed. */
