@@ -165,6 +165,38 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
   .dpad > button, .dpad div button { width: 40px; height: 40px; }
 }
 
+/* Touch and controller input are detected at runtime, independently of viewport size. */
+#app[data-input-mode="gamepad"], #app[data-input-mode="gamepad"] *,
+#app[data-input-mode="touch"], #app[data-input-mode="touch"] * { cursor: none !important; }
+#app[data-input-mode="gamepad"] .crosshair { left: 50% !important; top: 50% !important; opacity: 1 !important; }
+#app[data-input-mode="touch"] .controls { display: none !important; }
+#app[data-input-mode="touch"] .mobile-controls {
+  position: absolute; z-index: 8; display: flex; left: max(10px, env(safe-area-inset-left)); right: max(10px, env(safe-area-inset-right));
+  bottom: max(77px, calc(env(safe-area-inset-bottom) + 72px)); align-items: end; justify-content: space-between; pointer-events: none;
+}
+#app[data-input-mode="touch"] .mobile-controls button {
+  pointer-events: auto; min-height: 42px; border: 1px solid #9abac1; border-radius: 9px; padding: 0 9px;
+  color: white; background: rgba(16, 36, 47, .84); backdrop-filter: blur(8px); touch-action: none; user-select: none;
+}
+#app[data-input-mode="touch"] .dpad { display: grid; justify-items: center; gap: 4px; }
+#app[data-input-mode="touch"] .dpad > button, #app[data-input-mode="touch"] .dpad div button { width: 48px; height: 48px; font-size: 20px; padding: 0; }
+#app[data-input-mode="touch"] .dpad div { display: flex; gap: 4px; }
+#app[data-input-mode="touch"] .mobile-actions { display: grid; grid-template-columns: repeat(3, max-content); gap: 5px; justify-items: stretch; }
+#app[data-input-mode="touch"] .mobile-actions button { min-width: 48px; height: 43px; font-size: 9px; font-weight: 800; }
+#app[data-input-mode="touch"] .mobile-actions #mobile-fire { min-width: 76px; height: 52px; border-color: #72f1d6; background: rgba(22, 89, 86, .94); }
+#app[data-input-mode="touch"] .mobile-actions #mobile-aim { border-color: #f1d68f; }
+#app[data-input-mode="touch"] .hotbar { bottom: max(8px, env(safe-area-inset-bottom)); }
+#app[data-input-mode="touch"] .toast, #app[data-input-mode="touch"] .interaction-prompt { bottom: max(145px, calc(env(safe-area-inset-bottom) + 140px)); }
+.input-hint { color: #74e3d0; padding-top: 4px; border-top: 1px solid #577077; white-space: normal !important; }
+@media (max-width: 560px) {
+  #app[data-input-mode="touch"] .mobile-controls { left: 7px; right: 7px; bottom: max(72px, calc(env(safe-area-inset-bottom) + 68px)); }
+  #app[data-input-mode="touch"] .dpad > button, #app[data-input-mode="touch"] .dpad div button { width: 42px; height: 42px; }
+  #app[data-input-mode="touch"] .mobile-actions { gap: 2px; }
+  #app[data-input-mode="touch"] .mobile-actions button { min-width: 36px; height: 40px; padding: 0 3px; font-size: 7px; }
+  #app[data-input-mode="touch"] .mobile-actions #mobile-fire { min-width: 58px; height: 47px; }
+  #app[data-input-mode="touch"] .hotbar { bottom: max(7px, env(safe-area-inset-bottom)); }
+}
+
 /* Compact play HUD: details and the full loadout stay one click away. */
 .hud-left { width: 205px; padding: 11px 13px 12px; }
 .brand span { font-size: 25px; }

@@ -51,8 +51,9 @@ app.innerHTML = `
     <div><kbd>Q</kbd><span>BOTIQUÍN</span><kbd>SHIFT</kbd><span>CORRER</span></div>
     <div><kbd>SPACE</kbd><span>SALTAR</span><kbd>V</kbd><span>CÁMARA</span></div>
     <div><kbd>G</kbd><span>WIREFRAME</span></div>
+    <div id="input-hint" class="input-hint">Mouse y teclado activos</div>
   </aside>
-  <div class="mobile-controls" aria-label="Controles táctiles"><div class="dpad"><button data-key="KeyW" aria-label="Arriba">▲</button><div><button data-key="KeyA" aria-label="Izquierda">◀</button><button data-key="KeyS" aria-label="Abajo">▼</button><button data-key="KeyD" aria-label="Derecha">▶</button></div></div><div class="mobile-actions"><button id="mobile-interact">E</button><button id="mobile-roll">SALTAR</button><button id="mobile-fire" class="fire-button">DISPARAR</button></div></div>
+  <div class="mobile-controls" aria-label="Controles táctiles"><div class="dpad"><button data-key="KeyW" aria-label="Arriba">▲</button><div><button data-key="KeyA" aria-label="Izquierda">◀</button><button data-key="KeyS" aria-label="Abajo">▼</button><button data-key="KeyD" aria-label="Derecha">▶</button></div></div><div class="mobile-actions"><button id="mobile-interact" aria-label="Interactuar">E</button><button id="mobile-medkit" aria-label="Usar botiquín">BOTIQUÍN</button><button id="mobile-reload" aria-label="Recargar">RECARGAR</button><button id="mobile-aim" aria-label="Apuntar">APUNTAR</button><button id="mobile-roll">SALTAR</button><button id="mobile-fire" class="fire-button">DISPARAR</button></div></div>
   <div id="overlay" class="overlay hidden"><div class="overlay-card"><h1 id="overlay-title">EN PAUSA</h1><p id="overlay-copy">La ciudad seguirá en movimiento cuando regreses.</p><button id="resume">CONTINUAR</button><button id="restart">NUEVA CIUDAD</button></div></div>
 `;
 
@@ -133,6 +134,83 @@ const vehicles = new VehicleSystem(prefabs, grid, events, npcs, destruction);
 vehicles.setStreetActivity(cityClock.streetActivity);
 const clock = new THREE.Clock();
 const keys = new Set<string>();
+const touchAvailable = 'ontouchstart' in window || navigator.maxTouchPoints > 0 || matchMedia('(pointer: coarse)').matches;
+app.dataset.inputMode = touchAvailable ? 'touch' : 'mouse';
+const gamepadMove = new THREE.Vector2();
+let gamepadAim = new THREE.Vector2();
+let gamepadFireHeld = false;
+let gamepadAimHeld = false;
+let gamepadSprintHeld = false;
+let gamepadBrakeHeld = false;
+let gamepadThrottleHeld = false;
+let gamepadReverseHeld = false;
+let connectedPadId = '';
+let gamepadPreviousButtons: boolean[] = [];
+function setInputMode(mode: 'mouse' | 'touch' | 'gamepad', device = ''): void {
+  if (app.dataset.inputMode === mode) return;
+  app.dataset.inputMode = mode;
+  if (mode === 'gamepad') {
+    connectedPadId = device || connectedPadId;
+    document.querySelector<HTMLElement>('#input-hint')!.textContent = `${/xbox/i.test(connectedPadId) ? 'XBOX' : 'MANDO'} · LS MOVER · RS CÁMARA · A SALTAR · RT DISPARAR · LB APUNTAR · Y ARMA · MENU PAUSA`;
+    notify(`${/xbox/i.test(connectedPadId) ? 'MANDO XBOX' : 'MANDO'} DETECTADO`);
+  } else document.querySelector<HTMLElement>('#input-hint')!.textContent = mode === 'touch' ? 'TOQUE · ARRASTRA PARA MIRAR · BOTONES EN PANTALLA' : 'Mouse y teclado activos';
+}
+if (touchAvailable) document.querySelector<HTMLElement>('#input-hint')!.textContent = 'TOQUE · ARRASTRA PARA MIRAR · BOTONES EN PANTALLA';
+window.addEventListener('gamepadconnected', (event) => {
+  connectedPadId = event.gamepad.id;
+  setInputMode('gamepad', connectedPadId);
+});
+window.addEventListener('gamepaddisconnected', () => {
+  gamepadMove.set(0, 0); gamepadAim.set(0, 0); gamepadFireHeld = false; gamepadAimHeld = false;
+  gamepadThrottleHeld = false; gamepadReverseHeld = false; gamepadSprintHeld = false; gamepadBrakeHeld = false;
+  gamepadPreviousButtons = [];
+  setInputMode(touchAvailable ? 'touch' : 'mouse');
+});
+function pollGamepad(): void {
+  const pad = Array.from(navigator.getGamepads?.() || []).find((item): item is Gamepad => Boolean(item?.connected));
+  if (!pad) {
+    gamepadMove.set(0, 0); gamepadAim.set(0, 0); gamepadFireHeld = false; gamepadAimHeld = false;
+    gamepadSprintHeld = false; gamepadBrakeHeld = false; gamepadThrottleHeld = false; gamepadReverseHeld = false; gamepadPreviousButtons = [];
+    engine.setAiming(aimingDownSights);
+    app.dataset.aiming = String(aimingDownSights);
+    if (app.dataset.inputMode === 'gamepad') setInputMode(touchAvailable ? 'touch' : 'mouse');
+    return;
+  }
+  if (app.dataset.inputMode !== 'gamepad') setInputMode('gamepad', pad.id);
+  connectedPadId = pad.id;
+  const axis = (index: number): number => {
+    const raw = pad.axes[index] || 0, magnitude = Math.abs(raw);
+    return magnitude < 0.16 ? 0 : Math.sign(raw) * Math.min(1, (magnitude - 0.16) / 0.84);
+  };
+  const down = (index: number, threshold = 0.5): boolean => Boolean(pad.buttons[index] && (pad.buttons[index].pressed || pad.buttons[index].value >= threshold));
+  const edge = (index: number, value = down(index)): boolean => value && !gamepadPreviousButtons[index];
+  const lx = axis(0), ly = axis(1), rx = axis(2), ry = axis(3);
+  gamepadMove.set(lx, ly).clampLength(0, 1);
+  gamepadAim.set(rx, ry);
+  gamepadFireHeld = down(5) || down(7, 0.32);
+  gamepadAimHeld = down(4) || down(6, 0.32);
+  gamepadSprintHeld = down(10);
+  gamepadBrakeHeld = down(0);
+  gamepadThrottleHeld = down(7, 0.32);
+  gamepadReverseHeld = down(6, 0.32);
+  const active = Math.hypot(lx, ly, rx, ry) > 0.12 || pad.buttons.some((button) => button.pressed || button.value > 0.35);
+  if (active) setInputMode('gamepad', pad.id);
+  engine.setAiming(gamepadAimHeld || aimingDownSights);
+  app.dataset.aiming = String(gamepadAimHeld || aimingDownSights);
+  if (edge(0) && !vehicles.isDriving && !paused) player.jump();
+  if (edge(1) && !paused) {
+    const healed = inventory.useMedkit(player.health);
+    if (healed !== null) { player.health = healed; player.animateUseItem(); notify('BOTIQUÍN UTILIZADO', 'success'); }
+  }
+  if (edge(2) && !paused) calmCivilians();
+  if (edge(3)) selectWeapon(((['fists', 'pistol', 'smg', 'shotgun', 'rifle', 'charge'] as const).indexOf(inventory.weapon) + 1) % 6 + 1);
+  if ((edge(5) || edge(7, down(7, 0.32))) && !paused && !vehicles.isDriving) { pointerAim = gamepadAimTarget(); fireAt(pointerAim); }
+  if (edge(8)) setCameraMode(cameraModes[(cameraModes.indexOf(engine.mode) + 1) % cameraModes.length]);
+  if (edge(9)) togglePause();
+  if (edge(11) && !paused) notify(combat.startReload() ? 'RECARGANDO…' : 'NO HAY MUNICIÓN QUE RECARGAR');
+  for (let index = 0; index < 4; index++) if (edge(12 + index)) selectWeapon(index + 1);
+  gamepadPreviousButtons = pad.buttons.map((button, index) => button.pressed || button.value >= (index === 6 || index === 7 ? 0.32 : 0.5));
+}
 let pointerAim = new THREE.Vector3(0, 1.2, 6);
 let pointerTargetIsNpc = false;
 let pointerTargetHit: ReturnType<NPCController['raycast']> = null;
@@ -236,9 +314,15 @@ function screenAim(clientX: number, clientY: number): THREE.Vector3 {
   pointerTargetHit = null;
   return engine.groundPoint(clientX, clientY)?.clone() || player.group.position.clone().add(new THREE.Vector3(0, 0, 6));
 }
+function gamepadAimTarget(): THREE.Vector3 {
+  if (engine.mode === 'firstPerson') return screenAim(0, 0);
+  const rect = engine.renderer.domElement.getBoundingClientRect();
+  return pickTarget(rect.left + rect.width / 2, rect.top + rect.height / 2);
+}
 
 const cameraModes: CameraMode[] = ['isometric', 'perspective', 'firstPerson'];
 function requestFirstPersonLock(): void {
+  if (touchAvailable || app.dataset.inputMode === 'gamepad') { app.dataset.pointerLock = 'fallback'; return; }
   if (engine.mode !== 'firstPerson' || document.pointerLockElement === engine.renderer.domElement) return;
   const canvas = engine.renderer.domElement;
   const onUnavailable = (): void => {
@@ -290,7 +374,7 @@ function fireAt(target: THREE.Vector3): void {
   }
   queuedTapTime = 0;
   if (engine.mode !== 'firstPerson' && aimClient && combat.readyIn === 0) target = pickTarget(aimClient.x, aimClient.y);
-  const message = combat.fire(target, engine.mode === 'firstPerson', aimingDownSights, pointerTargetIsNpc, pointerTargetHit);
+  const message = combat.fire(target, engine.mode === 'firstPerson', aimingDownSights || gamepadAimHeld, pointerTargetIsNpc, pointerTargetHit);
   if (message) notify(message, message.includes('SIN ') || message.includes('CIVIL') ? 'danger' : 'success');
 }
 
@@ -308,6 +392,7 @@ function intimidateAt(clientX: number, clientY: number): void {
 }
 
 engine.renderer.domElement.addEventListener('pointermove', (event) => {
+  if (event.pointerType === 'mouse' && Math.hypot(event.movementX, event.movementY) > 3) setInputMode('mouse');
   if (engine.mode === 'firstPerson' && document.pointerLockElement === engine.renderer.domElement) {
     if (cameraDrag && Math.hypot(event.movementX, event.movementY) > 1) cameraDrag.moved = true;
     engine.orbit(event.movementX, event.movementY);
@@ -318,7 +403,13 @@ engine.renderer.domElement.addEventListener('pointermove', (event) => {
   if (event.pointerType === 'touch' && cameraTouches.has(event.pointerId)) {
     const previous = cameraTouches.get(event.pointerId)!;
     const dx = event.clientX - previous.x, dy = event.clientY - previous.y;
-    if (cameraTouches.size === 1) engine.pan(dx, dy);
+    if (cameraTouches.size === 1) {
+      if (engine.mode === 'firstPerson') {
+        engine.orbit(dx, dy);
+        engine.follow(player.group.position, 0, vehicles.heading, vehicles.cameraVehicle, vehicles.steeringAngle);
+        pointerAim = screenAim(0, 0);
+      } else engine.pan(dx, dy);
+    }
     else {
       const other = [...cameraTouches.entries()].find(([id]) => id !== event.pointerId)?.[1];
       if (other) {
@@ -543,20 +634,35 @@ function selectWeapon(slot: number): void {
 }
 document.querySelectorAll<HTMLButtonElement>('[data-slot]').forEach((button) => button.addEventListener('click', () => selectWeapon(Number(button.dataset.slot))));
 const mobileAim = () => {
-  aimClient = null;
-  if (engine.mode !== 'isometric') return screenAim(0, 0);
-  pointerTargetIsNpc = false;
-  pointerTargetHit = null;
-  return player.group.position.clone().add(new THREE.Vector3(Math.sin(player.group.rotation.y) * 9, 1.2, Math.cos(player.group.rotation.y) * 9));
+  if (engine.mode === 'firstPerson') { aimClient = null; return screenAim(0, 0); }
+  const rect = engine.renderer.domElement.getBoundingClientRect();
+  aimClient = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  return pickTarget(aimClient.x, aimClient.y);
 };
-$('#mobile-fire').addEventListener('pointerdown', (event) => { event.preventDefault(); firing = true; pointerAim = mobileAim(); fireAt(pointerAim); });
+$('#mobile-fire').addEventListener('pointerdown', (event) => { event.preventDefault(); setInputMode('touch'); firing = true; pointerAim = mobileAim(); fireAt(pointerAim); });
 $('#mobile-fire').addEventListener('pointerup', () => { firing = false; });
+$('#mobile-fire').addEventListener('pointercancel', () => { firing = false; });
+$('#mobile-aim').addEventListener('pointerdown', (event) => {
+  event.preventDefault(); setInputMode('touch'); aimingDownSights = true; engine.setAiming(true); app.dataset.aiming = 'true';
+  const rect = engine.renderer.domElement.getBoundingClientRect(); intimidateAt(rect.left + rect.width / 2, rect.top + rect.height / 2);
+});
+const releaseTouchAim = () => { aimingDownSights = false; engine.setAiming(false); app.dataset.aiming = 'false'; };
+$('#mobile-aim').addEventListener('pointerup', releaseTouchAim);
+$('#mobile-aim').addEventListener('pointercancel', releaseTouchAim);
+$('#mobile-interact').addEventListener('pointerdown', () => setInputMode('touch'));
 $('#mobile-interact').addEventListener('click', () => calmCivilians());
-$('#mobile-roll').addEventListener('pointerdown', () => { keys.add('Space'); if (!vehicles.isDriving) player.jump(); });
+$('#mobile-medkit').addEventListener('click', () => {
+  const healed = inventory.useMedkit(player.health);
+  if (healed !== null) { player.health = healed; player.animateUseItem(); notify('BOTIQUÍN UTILIZADO', 'success'); }
+  else notify('NO PUEDES USAR UN BOTIQUÍN AHORA');
+});
+$('#mobile-reload').addEventListener('click', () => notify(combat.startReload() ? 'RECARGANDO…' : 'NO HAY MUNICIÓN QUE RECARGAR'));
+$('#mobile-roll').addEventListener('pointerdown', (event) => { event.preventDefault(); setInputMode('touch'); keys.add('Space'); if (!vehicles.isDriving) player.jump(); });
 $('#mobile-roll').addEventListener('pointerup', () => keys.delete('Space'));
+$('#mobile-roll').addEventListener('pointercancel', () => keys.delete('Space'));
 document.querySelectorAll<HTMLButtonElement>('[data-key]').forEach((button) => {
   const key = button.dataset.key!;
-  button.addEventListener('pointerdown', (event) => { event.preventDefault(); button.setPointerCapture(event.pointerId); keys.add(key); });
+  button.addEventListener('pointerdown', (event) => { event.preventDefault(); setInputMode('touch'); button.setPointerCapture(event.pointerId); keys.add(key); });
   button.addEventListener('pointerup', () => keys.delete(key));
   button.addEventListener('pointercancel', () => keys.delete(key));
 });
@@ -594,6 +700,12 @@ function frame(): void {
   requestAnimationFrame(frame);
   if (document.hidden) return;
   const dt = Math.min(0.05, clock.getDelta());
+  pollGamepad();
+  if (gamepadAim.lengthSq() > 0.025 && !paused) {
+    engine.orbit(gamepadAim.x * dt * 230, gamepadAim.y * dt * 210);
+    engine.follow(player.group.position, 0, vehicles.heading, vehicles.cameraVehicle, vehicles.steeringAngle);
+    if (engine.mode === 'firstPerson') pointerAim = screenAim(0, 0);
+  }
   if (!paused && !gameOver) {
     cityClock.update(dt);
     prefabs.setStreetActivity(cityClock.streetActivity);
@@ -634,9 +746,9 @@ function frame(): void {
       citySimulationTimer = 0;
       vehicles.updateTraffic(cityDt, player);
     }
-    const forward = Number(keys.has('KeyW') || keys.has('ArrowUp')) - Number(keys.has('KeyS') || keys.has('ArrowDown'));
-    const right = Number(keys.has('KeyD') || keys.has('ArrowRight')) - Number(keys.has('KeyA') || keys.has('ArrowLeft'));
-    const input = engine.movementVector(forward, right);
+    const forward = THREE.MathUtils.clamp(Number(keys.has('KeyW') || keys.has('ArrowUp')) - Number(keys.has('KeyS') || keys.has('ArrowDown')) - gamepadMove.y, -1, 1);
+    const right = THREE.MathUtils.clamp(Number(keys.has('KeyD') || keys.has('ArrowRight')) - Number(keys.has('KeyA') || keys.has('ArrowLeft')) + gamepadMove.x, -1, 1);
+    const input = engine.movementVector(forward, right).clampLength(0, 1);
     if (playerRagdoll && playerKnockdownTime > 0) {
       playerKnockdownTime = Math.max(0, playerKnockdownTime - dt);
       const pelvis = ragdolls.pelvis(playerRagdoll);
@@ -646,8 +758,14 @@ function frame(): void {
         playerRagdoll = null;
         player.group.visible = true;
       }
-    } else if (vehicles.isDriving) vehicles.update(dt, { forward: keys.has('KeyW') || keys.has('ArrowUp'), reverse: keys.has('KeyS') || keys.has('ArrowDown'), left: keys.has('KeyA') || keys.has('ArrowLeft'), right: keys.has('KeyD') || keys.has('ArrowRight'), handbrake: keys.has('Space') }, player, engine.movementVector(0, 1));
-    else player.update(dt, input, destruction.colliders, keys.has('ShiftLeft') || keys.has('ShiftRight'));
+    } else if (vehicles.isDriving) vehicles.update(dt, {
+      forward: keys.has('KeyW') || keys.has('ArrowUp') || gamepadMove.y < -0.18 || gamepadThrottleHeld,
+      reverse: keys.has('KeyS') || keys.has('ArrowDown') || gamepadMove.y > 0.18 || gamepadReverseHeld,
+      left: keys.has('KeyA') || keys.has('ArrowLeft') || gamepadMove.x < -0.18,
+      right: keys.has('KeyD') || keys.has('ArrowRight') || gamepadMove.x > 0.18,
+      handbrake: keys.has('Space') || gamepadBrakeHeld
+    }, player, engine.movementVector(0, 1));
+    else player.update(dt, input, destruction.colliders, keys.has('ShiftLeft') || keys.has('ShiftRight') || gamepadSprintHeld);
     if (engine.mode === 'firstPerson' && document.pointerLockElement !== engine.renderer.domElement &&
         fallbackMouseInside && freeLookPoint) {
       const margin = 42;
@@ -661,7 +779,7 @@ function frame(): void {
       pointerAim = screenAim(0, 0);
       if (!vehicles.isDriving) player.aimAt(pointerAim);
     }
-    if (firing && (inventory.weapon === 'smg' || inventory.weapon === 'rifle')) fireAt(pointerAim);
+    if ((firing || gamepadFireHeld) && (inventory.weapon === 'smg' || inventory.weapon === 'rifle')) fireAt(gamepadFireHeld ? gamepadAimTarget() : pointerAim);
     destruction.update(dt, engine.camera);
     prefabs.updateWater(dt);
     interiors.update();
@@ -682,11 +800,12 @@ function frame(): void {
     if (toastTimer > 0) { toastTimer -= dt; if (toastTimer <= 0) $('#toast').classList.remove('visible'); }
     engine.follow(player.group.position, dt, vehicles.heading, vehicles.cameraVehicle, vehicles.steeringAngle);
     cityLights.update(dt, player.group.position, cityClock);
-    if (aimingDownSights) {
+    if (aimingDownSights || gamepadAimHeld) {
       intimidationTimer -= dt;
       if (intimidationTimer <= 0) {
         intimidationTimer = 0.24;
         if (engine.mode === 'firstPerson') intimidateAt(0, 0);
+        else if (gamepadAimHeld) { const rect = engine.renderer.domElement.getBoundingClientRect(); intimidateAt(rect.left + rect.width / 2, rect.top + rect.height / 2); }
         else if (aimClient) intimidateAt(aimClient.x, aimClient.y);
       }
     }
