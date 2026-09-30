@@ -126,7 +126,6 @@ export class VehicleSystem {
       const step = state.speed * state.direction * dt;
       const nextX = car.position.x + (state.axis === 'x' ? step : 0);
       const nextZ = car.position.z + (state.axis === 'z' ? step : 0);
-      const nextCell = this.grid.cellAtWorld(nextX, nextZ);
       const carSpecs = car.userData.vehicle as { length: number; width: number };
       const target = state.axis === 'x' ? state.direction * Math.PI / 2 : state.direction > 0 ? 0 : Math.PI;
       const roadIndex=this.grid.grid(car.position.x,car.position.z)[state.axis==='x'?1:0];
