@@ -156,6 +156,7 @@ function setInputMode(mode: 'mouse' | 'touch' | 'gamepad', device = ''): void {
   } else document.querySelector<HTMLElement>('#input-hint')!.textContent = mode === 'touch' ? 'TOQUE · ARRASTRA PARA MIRAR · BOTONES EN PANTALLA' : 'Mouse y teclado activos';
 }
 if (touchAvailable) document.querySelector<HTMLElement>('#input-hint')!.textContent = 'TOQUE · ARRASTRA PARA MIRAR · BOTONES EN PANTALLA';
+app.addEventListener('pointerdown', (event) => { if (event.pointerType === 'touch') setInputMode('touch'); });
 window.addEventListener('gamepadconnected', (event) => {
   connectedPadId = event.gamepad.id;
   setInputMode('gamepad', connectedPadId);
