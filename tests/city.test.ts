@@ -885,7 +885,11 @@ test('targeted hits knock NPCs down, repeated limb hits detach, and lost legs pr
   const initialBlood = bleeding.length;
   controller.hitByVehicle(roadVictim, 2.2, new THREE.Vector3(1, 0, 0));
   assert.ok(roadVictim.stamina < 4.5 && roadVictim.stamina > 0, 'the impact removes HP');
-  assert.ok(roadVictim.ragdoll && !roadVictim.group.visible, 'the impact starts ragdoll motion');
+  assert.ok(roadVictim.hitReaction && !roadVictim.ragdoll && roadVictim.group.visible,
+    'a vehicle impact uses the visible articulated fall instead of a ragdoll');
+  controller.update(0.5);
+  assert.ok((roadVictim.group.userData.rig as { hips: THREE.Group }).hips.position.y < 1.32,
+    'the impact animates the pedestrian down to the ground');
   assert.equal(bleeding.length, initialBlood + 1, 'the collision emits visible blood');
   const armNpc = makeNpc(100, 0);
   armNpc.marker.userData.marker = true; armNpc.group.add(armNpc.marker);

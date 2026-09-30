@@ -223,7 +223,7 @@ export class NPCController {
     npc.fearTime = Math.max(npc.fearTime || 0, 0.45);
     if (npc.kind === 'civilian') { npc.panic = Math.max(npc.panic, 0.85); this.flee(npc, this.player.position.x, this.player.position.z); }
     const impulse = (point || npc.group.position).clone().sub(this.player.position).setY(1.6).normalize().multiplyScalar(3.1 + amount);
-    if (part === 'head' && !npc.ragdoll) {
+    if (!npc.ragdoll && part !== 'torso') {
       npc.ragdoll = this.ragdolls.spawn(npc.group.position, npc.group.rotation.y, impulse,
         npc.group.userData.ragdollColors, Math.round((npc.group.position.y-this.grid.terrain.height(npc.group.position.x,npc.group.position.z))/FLOOR_HEIGHT), 1, 25, npc.missing, this.ragdollPose(npc));
       npc.group.visible = false;
