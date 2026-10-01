@@ -1331,7 +1331,13 @@ export class PrefabManager {
     for (const state of this.dirtyAggregates) {
       this.dirtyAggregates.delete(state);
       if (state.pending) continue;
-      this.queueDecorationMesh(state);
+      // Avoid paying structured-clone and transfer setup for small surfaces.
+      // Large aggregates are the ones that can cause visible main-thread stalls.
+      if (state.pieces.length <= 80) {
+        const surface = meshVoxelDecorations(state.pieces.map((piece) => piece.mesh));
+        this.applyDecorationMesh(state, surface ?? { positions: new Float32Array(), normals: new Float32Array(),
+          colors: new Float32Array(), indexes: new Uint32Array(), voxelForFace: new Uint32Array(), exposedFaces: 0, quads: 0 });
+      } else this.queueDecorationMesh(state);
       break;
     }
     this.flushGroundDamage();
@@ -1372,6 +1378,11 @@ export class PrefabManager {
       this.dirtyAggregates.add(state);
       return;
     }
+    this.applyDecorationMesh(state, result);
+  }
+
+  private applyDecorationMesh(state: StaticAggregateState,
+    result: Pick<DecorationMeshResult, 'positions' | 'normals' | 'colors' | 'indexes' | 'voxelForFace'>): void {
     const geometry = new THREE.BufferGeometry();
     for (let i = 0; i < result.positions.length; i++) result.positions[i] *= VOXEL_SIZE;
     geometry.setAttribute('position', new THREE.BufferAttribute(result.positions, 3));
