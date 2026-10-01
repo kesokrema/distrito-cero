@@ -45,8 +45,8 @@ export interface InteriorPiece {
   groundObstacle?: boolean;
   inverseWorld?: THREE.Matrix4;
   renderParent?: THREE.Object3D;
-  batch?: { mesh: THREE.InstancedMesh; index: number; parent: THREE.Group };
-  aggregate?: { mesh: THREE.Mesh; pieces: InteriorPiece[] };
+  batch?: { mesh: THREE.InstancedMesh; index: number; parent: THREE.Object3D };
+  aggregate?: StaticAggregateState;
 }
 export interface PedestrianAnchor { cell: Cell; type: BuildingPlan['type']; district: District }
 export interface PublicAnchor { cell: Cell; activity: 'rest' | 'browse' | 'wait' }
@@ -69,6 +69,11 @@ type FarMeshResult = {
   indexes: Uint32Array; voxelForFace: Uint32Array; exposedFaces: number; quads: number;
 };
 type MeshRequest = { assets: BlockAssets; region: ShellRegion; revision: number };
+type DecorationPieceStatic = { nx: number; ny: number; nz: number; voxelSize: number; tint: readonly [number, number, number]; matrixWorld: Float32Array };
+type StaticAggregateState = { mesh: THREE.Mesh; pieces: InteriorPiece[]; revision: number; pending: boolean; workerPieces?: DecorationPieceStatic[] };
+type DecorationMeshResult = { id: number; revision: number; positions: Float32Array; normals: Float32Array; colors: Float32Array;
+  indexes: Uint32Array; voxelForFace: Uint32Array; exposedFaces: number; quads: number };
+type DecorationMeshRequest = { state: StaticAggregateState; revision: number };
 const SHELL_REGION_CELLS = 4;
 const SURFACE_GAP = 0.025;
 const FACADE_BAND_COLOR = '#dfceb0';
@@ -180,6 +185,7 @@ export class PrefabManager {
   private interiorPieceByMesh = new WeakMap<THREE.Object3D, InteriorPiece>();
   private scenePieceByBatch = new WeakMap<THREE.InstancedMesh, InteriorPiece[]>();
   private aggregatePiecesByMesh = new WeakMap<THREE.Mesh, InteriorPiece[]>();
+  private staticBatchMaterials = new Map<string, THREE.MeshStandardMaterial>();
   private interiorPiecesByCell = new Map<number, InteriorPiece[]>();
   private navigationChanges = new Set<number>();
   private vehicleParts = new WeakMap<THREE.Group, InteriorPiece[]>();
@@ -189,7 +195,7 @@ export class PrefabManager {
   private interiorAreas: Array<{ x0: number; x1: number; z0: number; z1: number; upper: number[] }> = [];
   private dummy = new THREE.Object3D();
   private readonly occupancyProbe = new THREE.Vector3();
-  private readonly dirtyAggregates = new Set<{ mesh: THREE.Mesh; pieces: InteriorPiece[] }>();
+  private readonly dirtyAggregates = new Set<StaticAggregateState>();
   private voxelsByCell = new Map<number, number[]>();
   private entranceApproaches = new Set<number>();
   private groundTiles: THREE.Mesh[] = [];
@@ -200,8 +206,11 @@ export class PrefabManager {
   private groundVisible = true;
   private readonly dirtyGround = new Set<THREE.Mesh>();
   private meshWorker: Worker;
+  private decorationWorker: Worker;
   private nextMeshRequest = 1;
+  private nextDecorationRequest = 1;
   private meshRequests = new Map<number, MeshRequest>();
+  private decorationRequests = new Map<number, DecorationMeshRequest>();
   private shellMaterial = new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.91, vertexColors: true });
   private landmarkCell: Cell;
   private pendingBlock: Generator<void, BlockBounds> | null = null;
@@ -256,6 +265,8 @@ export class PrefabManager {
     };
     this.meshWorker = new Worker(new URL('../workers/mesh.worker.ts', import.meta.url), { type: 'module' });
     this.meshWorker.onmessage = (event: MessageEvent<FarMeshResult>) => this.receiveFarMesh(event.data);
+    this.decorationWorker = new Worker(new URL('../workers/decoration.worker.ts', import.meta.url), { type: 'module' });
+    this.decorationWorker.onmessage = (event: MessageEvent<DecorationMeshResult>) => this.receiveDecorationMesh(event.data);
     scene.add(this.buildings);
     // Fix the entire city's parcel/building blueprint before any detailed
     // chunk geometry is built. The geometry and occupants remain streamed.
@@ -288,7 +299,9 @@ export class PrefabManager {
 
   dispose(): void {
     this.meshWorker.terminate();
+    this.decorationWorker.terminate();
     for (const assets of this.blockAssets.values()) for (const region of assets.regions.values()) region.mesh?.geometry.dispose();
+    for (const material of this.staticBatchMaterials.values()) material.dispose();
     this.shellMaterial.dispose();
   }
 
@@ -443,6 +456,10 @@ export class PrefabManager {
     this.registerCityLights(roots);
     const props = this.collectBlockProps(roots);
     this.batchStaticSubtrees(props);
+    // Interior fixtures and stair parts are static until individually hit.
+    // Instance them per building as well, keeping each source voxel recoverable
+    // so destruction still converts just that voxel back to a live mesh.
+    for (const interior of this.interiorLodGroups.slice(interiorCount)) this.batchStaticSubtrees(interior);
     this.scene.add(props);
     props.updateMatrixWorld(true);
     props.traverse((object) => { object.matrixAutoUpdate = false; object.matrixWorldAutoUpdate = false; });
@@ -545,33 +562,36 @@ export class PrefabManager {
 
   private collectBlockProps(roots: THREE.Object3D[]): THREE.Group {
     const props = new THREE.Group();
-    const batches = new Map<string, THREE.Mesh[]>();
+    const batches = new Map<string, { meshes: THREE.Mesh[]; tint: boolean; material: THREE.Material }>();
     for (const object of roots) {
       if (object.userData.dynamicVehicle) continue;
       if (!(object instanceof THREE.Mesh) || object instanceof THREE.InstancedMesh || !object.visible || Array.isArray(object.material)) {
         props.add(object);
         continue;
       }
-      const key = `${object.geometry.uuid}:${object.material.uuid}:${Number(object.castShadow)}:${Number(object.receiveShadow)}`;
-      let meshes = batches.get(key);
-      if (!meshes) { meshes = []; batches.set(key, meshes); }
-      meshes.push(object);
+      const style = this.staticBatchStyle(object.material);
+      const key = `${object.geometry.uuid}:${style.key}:${Number(object.castShadow)}:${Number(object.receiveShadow)}`;
+      let batch = batches.get(key);
+      if (!batch) { batch = { meshes: [], tint: style.tint, material: style.material }; batches.set(key, batch); }
+      batch.meshes.push(object);
     }
-    for (const meshes of batches.values()) {
+    for (const { meshes, tint, material } of batches.values()) {
       if (meshes.length === 1) { props.add(meshes[0]); continue; }
       const first = meshes[0];
-      const batch = new THREE.InstancedMesh(first.geometry, first.material, meshes.length);
+      const batch = new THREE.InstancedMesh(first.geometry, material, meshes.length);
       batch.castShadow = first.castShadow;
       batch.receiveShadow = first.receiveShadow;
       meshes.forEach((mesh, index) => {
         mesh.updateMatrix();
         batch.setMatrixAt(index, mesh.matrix);
+        if (tint) batch.setColorAt(index, (mesh.material as THREE.MeshStandardMaterial).color);
         const piece = this.interiorPieceByMesh.get(mesh);
         if (piece) piece.batch = { mesh: batch, index, parent: props };
         this.scene.remove(mesh);
       });
       this.scenePieceByBatch.set(batch, meshes.map((mesh) => this.interiorPieceByMesh.get(mesh)!));
       batch.instanceMatrix.needsUpdate = true;
+      if (tint && batch.instanceColor) batch.instanceColor.needsUpdate = true;
       props.add(batch);
     }
     return props;
@@ -642,7 +662,8 @@ export class PrefabManager {
     this.scene.add(aggregateRoot);
     roots.push(aggregateRoot);
 
-    const state = { mesh, pieces };
+    const state: StaticAggregateState = { mesh, pieces, revision: 0, pending: false,
+      workerPieces: pieces.map((piece) => this.decorationPieceStatic(piece)) };
     this.aggregatePiecesByMesh.set(mesh, pieces);
     for (const piece of pieces) {
       piece.aggregate = state;
@@ -650,26 +671,68 @@ export class PrefabManager {
     }
   }
 
-  /** Batch repeated steps, floors and furnishing parts in their own local frame. Logical meshes keep their identity for damage and interactions. */
+  /** Batch destructible static voxels across one block, not just within their
+   * immediate furnishing group. Source meshes retain their parent and local
+   * transforms so an impacted voxel can be restored as an individual mesh. */
   private batchStaticSubtrees(root: THREE.Group): void {
-    for (const child of [...root.children]) if (child instanceof THREE.Group) this.batchStaticSubtrees(child);
-    const groups = new Map<string, THREE.Mesh[]>();
-    for (const child of root.children) {
-      if (!(child instanceof THREE.Mesh) || child instanceof THREE.InstancedMesh || !this.interiorPieceByMesh.has(child) || !child.visible) continue;
-      const key = `${child.geometry.uuid}:${Array.isArray(child.material) ? '' : child.material.uuid}`;
-      let list = groups.get(key); if (!list) { list = []; groups.set(key, list); } list.push(child);
-    }
-    for (const meshes of groups.values()) {
+    root.updateMatrixWorld(true);
+    const rootInverse = root.matrixWorld.clone().invert();
+    const groups = new Map<string, { meshes: THREE.Mesh[]; tint: boolean; material: THREE.Material }>();
+    root.traverse((object) => {
+      if (!(object instanceof THREE.Mesh) || object instanceof THREE.InstancedMesh || !object.visible || Array.isArray(object.material)) return;
+      const piece = this.interiorPieceByMesh.get(object);
+      if (!piece?.alive || piece.aggregate || piece.batch) return;
+      const style = this.staticBatchStyle(object.material);
+      const key = `${object.geometry.uuid}:${style.key}:${Number(object.castShadow)}:${Number(object.receiveShadow)}`;
+      let group = groups.get(key);
+      if (!group) { group = { meshes: [], tint: style.tint, material: style.material }; groups.set(key, group); }
+      group.meshes.push(object);
+    });
+    for (const { meshes, tint, material } of groups.values()) {
       if (meshes.length < 2) continue;
-      const batch = new THREE.InstancedMesh(meshes[0].geometry, meshes[0].material, meshes.length);
-      batch.castShadow = meshes.some((mesh) => mesh.castShadow); batch.receiveShadow = true;
+      const batch = new THREE.InstancedMesh(meshes[0].geometry, material, meshes.length);
+      batch.castShadow = meshes.some((mesh) => mesh.castShadow);
+      batch.receiveShadow = meshes.some((mesh) => mesh.receiveShadow);
+      const pieces: InteriorPiece[] = [];
       meshes.forEach((mesh, index) => {
-        mesh.updateMatrix(); batch.setMatrixAt(index, mesh.matrix); mesh.visible = false;
-        this.interiorPieceByMesh.get(mesh)!.batch = { mesh: batch, index, parent: root };
+        mesh.updateWorldMatrix(true, false);
+        this.dummy.matrix.multiplyMatrices(rootInverse, mesh.matrixWorld);
+        batch.setMatrixAt(index, this.dummy.matrix);
+        if (tint) batch.setColorAt(index, (mesh.material as THREE.MeshStandardMaterial).color);
+        const piece = this.interiorPieceByMesh.get(mesh)!;
+        piece.batch = { mesh: batch, index, parent: mesh.parent ?? root };
+        pieces.push(piece);
+        mesh.visible = false;
       });
-      this.scenePieceByBatch.set(batch, meshes.map((mesh) => this.interiorPieceByMesh.get(mesh)!));
-      batch.instanceMatrix.needsUpdate = true; batch.computeBoundingSphere(); root.add(batch);
+      this.scenePieceByBatch.set(batch, pieces);
+      batch.instanceMatrix.needsUpdate = true;
+      if (tint && batch.instanceColor) batch.instanceColor.needsUpdate = true;
+      batch.computeBoundingSphere();
+      root.add(batch);
     }
+  }
+
+  /** Instance static voxel shapes across their colour variants when all shader
+   * features match. A shared white base material plus instanceColor preserves
+   * per-block paint without paying for another draw call per colour. */
+  private staticBatchStyle(material: THREE.Material): { key: string; material: THREE.Material; tint: boolean } {
+    if (!(material instanceof THREE.MeshStandardMaterial) || material.map || material.alphaMap || material.aoMap ||
+        material.lightMap || material.bumpMap || material.normalMap || material.displacementMap || material.roughnessMap ||
+        material.metalnessMap || material.emissiveMap || material.envMap || material.transparent || material.opacity !== 1 ||
+        material.alphaTest > 0 || material.blending !== THREE.NormalBlending) {
+      return { key: material.uuid, material, tint: false };
+    }
+    const style = [material.roughness, material.metalness, material.vertexColors, material.side, material.flatShading,
+      material.emissive.getHex(), material.emissiveIntensity, material.fog, material.toneMapped, material.dithering,
+      material.depthTest, material.depthWrite, material.colorWrite, material.polygonOffset,
+      material.polygonOffsetFactor, material.polygonOffsetUnits].join(':');
+    let batchMaterial = this.staticBatchMaterials.get(style);
+    if (!batchMaterial) {
+      batchMaterial = material.clone();
+      batchMaterial.color.set(0xffffff);
+      this.staticBatchMaterials.set(style, batchMaterial);
+    }
+    return { key: `standard:${style}`, material: batchMaterial, tint: true };
   }
 
   private walkSurfacePieces=new Map<string,InteriorPiece[]>();
@@ -1143,7 +1206,7 @@ export class PrefabManager {
         container.add(aggregate);
         aggregate.position.y = -container.getWorldPosition(new THREE.Vector3()).y;
         this.aggregatePiecesByMesh.set(aggregate, pieces);
-        const state = { mesh: aggregate, pieces };
+        const state: StaticAggregateState = { mesh: aggregate, pieces, revision: 0, pending: false };
         for (const piece of pieces) { piece.aggregate = state; piece.mesh.visible = false; }
       }
     }
@@ -1265,32 +1328,64 @@ export class PrefabManager {
   }
 
   flushStaticDamage(): void {
-    const deadline = performance.now() + 3;
     for (const state of this.dirtyAggregates) {
-      const surface = meshVoxelDecorations(state.pieces.map(piece => piece.mesh));
-      if (surface) {
-        const geometry = new THREE.BufferGeometry();
-        for (let i = 0; i < surface.positions.length; i++) surface.positions[i] *= VOXEL_SIZE;
-        geometry.setAttribute('position', new THREE.BufferAttribute(surface.positions, 3));
-        geometry.setAttribute('normal', new THREE.BufferAttribute(surface.normals, 3));
-        geometry.setAttribute('color', new THREE.BufferAttribute(surface.colors, 3));
-        geometry.setIndex(new THREE.BufferAttribute(surface.indexes, 1));
-        geometry.userData.decorationPieceForFace = surface.voxelForFace;
-        // The generator emits world coordinates. Original floor aggregates
-        // can live under an elevated building group rather than a world root.
-        geometry.applyMatrix4(state.mesh.matrixWorld.clone().invert());
-        geometry.computeBoundingSphere();
-        state.mesh.geometry.dispose(); state.mesh.geometry = geometry;
-        state.mesh.material = voxelDecorationMaterial;
-        state.mesh.visible = Boolean(surface.indexes.length);
-      } else {
-        state.mesh.visible=false;
-        state.mesh.geometry.dispose();state.mesh.geometry=new THREE.BufferGeometry();
-      }
       this.dirtyAggregates.delete(state);
-      if (performance.now() >= deadline) break;
+      if (state.pending) continue;
+      this.queueDecorationMesh(state);
+      break;
     }
     this.flushGroundDamage();
+  }
+
+  private queueDecorationMesh(state: StaticAggregateState): void {
+    const id = this.nextDecorationRequest++;
+    const revision = state.revision;
+    const transfers: Transferable[] = [];
+    const staticPieces = state.workerPieces ?? (state.workerPieces = state.pieces.map((piece) => this.decorationPieceStatic(piece)));
+    const pieces = state.pieces.map((piece, index) => {
+      const mask = piece.mask.slice();
+      transfers.push(mask.buffer);
+      return { ...staticPieces[index], mask };
+    });
+    this.decorationRequests.set(id, { state, revision });
+    state.pending = true;
+    this.decorationWorker.postMessage({ id, revision, gridSize: VOXEL_SIZE, pieces }, transfers);
+  }
+
+  private decorationPieceStatic(piece: InteriorPiece): DecorationPieceStatic {
+    const paint = piece.mesh.material as THREE.MeshStandardMaterial;
+    const vertexColor = piece.mesh.geometry.getAttribute('color');
+    const tint = paint.color.clone();
+    if (vertexColor && vertexColor.count) tint.multiply(new THREE.Color().setRGB(vertexColor.getX(0), vertexColor.getY(0), vertexColor.getZ(0)));
+    return { nx: piece.dimensions.nx, ny: piece.dimensions.ny, nz: piece.dimensions.nz,
+      voxelSize: piece.dimensions.voxelSize ?? VOXEL_SIZE, tint: [tint.r, tint.g, tint.b],
+      matrixWorld: new Float32Array(piece.mesh.matrixWorld.elements) };
+  }
+
+  private receiveDecorationMesh(result: DecorationMeshResult): void {
+    const request = this.decorationRequests.get(result.id);
+    if (!request) return;
+    this.decorationRequests.delete(result.id);
+    const { state, revision } = request;
+    state.pending = false;
+    if (revision !== state.revision) {
+      this.dirtyAggregates.add(state);
+      return;
+    }
+    const geometry = new THREE.BufferGeometry();
+    for (let i = 0; i < result.positions.length; i++) result.positions[i] *= VOXEL_SIZE;
+    geometry.setAttribute('position', new THREE.BufferAttribute(result.positions, 3));
+    geometry.setAttribute('normal', new THREE.BufferAttribute(result.normals, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(result.colors, 3));
+    geometry.setIndex(new THREE.BufferAttribute(result.indexes, 1));
+    geometry.userData.decorationPieceForFace = result.voxelForFace;
+    state.mesh.updateWorldMatrix(true, false);
+    geometry.applyMatrix4(state.mesh.matrixWorld.clone().invert());
+    geometry.computeBoundingSphere();
+    state.mesh.geometry.dispose();
+    state.mesh.geometry = geometry;
+    state.mesh.material = voxelDecorationMaterial;
+    state.mesh.visible = Boolean(result.indexes.length);
   }
 
   private roadMarkings(bounds: BlockBounds): Array<{ x: number; z: number; w: number; d: number; paint: string }> {
@@ -1677,6 +1772,7 @@ export class PrefabManager {
     if (!subs.length || !piece.alive) return;
     this.preparePieceDamage(piece);
     if (piece.aggregate) {
+      piece.aggregate.revision++;
       this.dirtyAggregates.add(piece.aggregate);
     }
     if (piece.batch) {

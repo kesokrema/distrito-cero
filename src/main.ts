@@ -243,6 +243,7 @@ let damageCooldown = 0;
 let hudTimer = 0;
 let streamingTimer = 0;
 let citySimulationTimer = 0;
+let ragdollSimulationTimer = 0;
 let toastTimer = 0;
 let lastClockLabel = '';
 
@@ -743,8 +744,17 @@ function frame(): void {
     lastClockLabel = cityClock.label;
     document.querySelector('#clock-time')!.textContent = lastClockLabel;
   }
-  if (!paused) ragdolls.update(dt, (x, z) => prefabs.isWorldActive(x, z) ||
-    Math.hypot(x - player.group.position.x, z - player.group.position.z) < 18);
+  if (paused) {
+    ragdollSimulationTimer = 0;
+  } else {
+    ragdollSimulationTimer += dt;
+    if (ragdollSimulationTimer >= 1 / 30) {
+      const physicsDt = Math.min(ragdollSimulationTimer, 1 / 30);
+      ragdollSimulationTimer -= physicsDt;
+      ragdolls.update(physicsDt, (x, z) => prefabs.isWorldActive(x, z) ||
+        Math.hypot(x - player.group.position.x, z - player.group.position.z) < 18);
+    }
+  }
   if (!paused && !gameOver) {
     damageCooldown = Math.max(0, damageCooldown - dt);
     streamingTimer -= dt;

@@ -111,8 +111,10 @@ export class RenderEngine {
     this.ssao.minDistance = 0.001;
     this.ssao.maxDistance = 0.055;
     const aoMode = new URLSearchParams(window.location.search).get('ao');
-    this.adaptiveAO = aoMode === null;
-    if (aoMode === '0' || (this.mobile && aoMode !== '1')) this.ssao.enabled = false;
+    // Screen-space AO adds several full-scene passes. Keep the baked voxel
+    // corner AO as the default and let players opt into SSAO when desired.
+    this.adaptiveAO = aoMode === 'auto';
+    this.ssao.enabled = aoMode === '1' || aoMode === 'auto';
     this.composer.addPass(this.ssao);
     this.composer.addPass(new OutputPass());
     this.resize();
@@ -440,18 +442,30 @@ export class RenderEngine {
   render(): void {
     // Static city shadows need not redraw the full scene on every frame.
     const now = performance.now();
-    if (now - this.lastShadowUpdate >= (this.mobile ? 200 : 125)) {
+    if (now - this.lastShadowUpdate >= (this.mobile ? 350 : 250)) {
       this.renderer.shadowMap.needsUpdate = true;
       this.lastShadowUpdate = now;
     }
     this.renderer.info.reset();
     const start = performance.now();
-    this.composer.render();
+    if (this.ssao.enabled) {
+      this.composer.render();
+    } else {
+      // Avoid EffectComposer and its extra render/output passes when the
+      // optional screen-space effect is disabled.
+      const override = this.scene.overrideMaterial;
+      try {
+        this.scene.overrideMaterial = this.wireframeEnabled ? this.wireframeMaterial : null;
+        this.renderer.render(this.scene, this.camera);
+      } finally {
+        this.scene.overrideMaterial = override;
+      }
+    }
     // Voxel corner AO is baked into the chunk mesh at every quality level.
     // Drop only the extra screen-space passes when they exceed the frame
     // budget on a slow GPU/driver; explicit ?ao=1 remains useful for comparison.
     this.renderCost = this.renderCost * .95 + (performance.now() - start) * .05;
-    if (++this.renderedFrames > 80 && this.adaptiveAO && this.renderCost > 22) this.ssao.enabled = false;
+    if (++this.renderedFrames > 80 && this.adaptiveAO && this.renderCost > 16) this.ssao.enabled = false;
   }
   dispose(): void {
     this.atmosphere.dispose();

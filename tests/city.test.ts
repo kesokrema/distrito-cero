@@ -37,7 +37,17 @@ import { mixamoReferencePose, retargetMixamoClip } from '../src/actors/MixamoAni
 class MeshWorker {
   static jobs: Array<() => void> = [];
   onmessage?: (event: { data: unknown }) => void;
-  postMessage({ id, pieces, references, renderOwners, voxelSize, latticeOffset }: { id: number; pieces: Float32Array; references: Uint32Array; renderOwners: Uint8Array; voxelSize:number; latticeOffset:number[] }): void {
+  postMessage(message: { id: number; pieces: Float32Array | unknown[]; references?: Uint32Array; renderOwners?: Uint8Array;
+    voxelSize?:number; latticeOffset?:number[]; revision?:number; gridSize?:number }): void {
+    if (message.gridSize !== undefined) {
+      MeshWorker.jobs.push(() => this.onmessage?.({ data: { id: message.id, revision: message.revision,
+        positions: new Float32Array(), normals: new Float32Array(), colors: new Float32Array(), indexes: new Uint32Array(),
+        voxelForFace: new Uint32Array(), exposedFaces: 0, quads: 0 } }));
+      return;
+    }
+    const { id, pieces, references, renderOwners, voxelSize, latticeOffset } = message as {
+      id: number; pieces: Float32Array; references: Uint32Array; renderOwners: Uint8Array; voxelSize:number; latticeOffset:number[]
+    };
     MeshWorker.jobs.push(() => {
       for (let i = 0; i < pieces.length; i += 6) for (let axis = 0; axis < 3; axis++) pieces[i + axis] = Math.round(pieces[i + axis] / voxelSize - latticeOffset[axis]);
       const geometry = meshVoxelCells(pieces, references, true, renderOwners);
