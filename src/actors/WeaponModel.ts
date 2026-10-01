@@ -15,7 +15,7 @@ export function createWeaponModel(kind: Weapon): THREE.Group {
   const dark = mat('#202e37'), steel = mat('#667987'), highlight = mat('#b4bdba');
   const wood = mat('#a57652'), orange = mat('#ed9a53');
   const box = (w: number, h: number, d: number, color: THREE.Material, x: number, y: number, z: number): void => {
-    const mesh = voxelShape(w, h, d, color); mesh.position.set(x, y, z); mesh.castShadow = true; root.add(mesh);
+    const mesh = voxelShape(w, h, d, color); mesh.position.set(x, y, z); mesh.castShadow = false; root.add(mesh);
   };
   if (kind === 'fists') return root;
   if (kind === 'charge') {
@@ -40,7 +40,7 @@ export function createWeaponModel(kind: Weapon): THREE.Group {
     const launcher = new THREE.Mesh(voxelSurfaceGeometry(nx, ny, nz, mask, false, colors),
       new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.72, metalness: 0.24 }));
     launcher.position.set(0, -0.08, 0.66);
-    launcher.castShadow = true;
+    launcher.castShadow = false;
     launcher.userData.voxelSize = VOXEL_SIZE;
     root.add(launcher);
     return root;

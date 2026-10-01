@@ -46,8 +46,8 @@ export function createHumanoid(outfit: Outfit, expression: FaceExpression = 'nor
     mesh.position.set(x, y, z);
     if (part) mesh.userData.bodyPart = part;
     mesh.userData.actorVoxel = true;
-    // Dynamic actors do not each need a shadow draw call; the city sun and
-    // ambient occlusion carry the contact and silhouette cues.
+    // Moving actors share a simple contact shadow instead of drawing each limb
+    // into the city's cached sun shadow map.
     mesh.castShadow = false;
     parent.add(mesh);
     return mesh;

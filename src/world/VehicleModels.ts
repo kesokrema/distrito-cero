@@ -675,7 +675,7 @@ export function createVehicleModel(type: VehicleType, hex: string, variant: numb
   const geometry = voxelSurfaceGeometry(nx, ny, nz, l.mask, false, colors, voxel);
   const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color: '#ffffff', vertexColors: true, roughness: 0.7, metalness: 0.11 }));
   mesh.position.y = ny * voxel / 2;
-  mesh.castShadow = true;
+  mesh.castShadow = false;
   mesh.receiveShadow = true;
   mesh.userData.voxelDimensions = { nx, ny, nz, voxelSize: voxel };
   mesh.userData.voxelMask = l.mask;

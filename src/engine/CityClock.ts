@@ -1,13 +1,13 @@
 import * as THREE from 'three';
 
-/** One game day in fifteen real minutes. An explicit hour keeps visual tests reproducible. */
+/** One game day in one real hour. An explicit hour keeps visual tests reproducible. */
 export class CityClock {
   hour: number;
   constructor(initialHour = Math.random() * 24) {
     this.hour = ((initialHour % 24) + 24) % 24;
   }
 
-  update(dt: number): void { this.hour = (this.hour + dt * 24 / 900) % 24; }
+  update(dt: number): void { this.hour = (this.hour + dt * 24 / 3600) % 24; }
 
   get daylight(): number {
     return THREE.MathUtils.smoothstep(Math.sin((this.hour - 6) * Math.PI / 12), -0.12, 0.42);

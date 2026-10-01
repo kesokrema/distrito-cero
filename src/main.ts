@@ -8,6 +8,7 @@ import { DestructionSystem } from './world/DestructionSystem';
 import { RenderEngine, type CameraMode } from './engine/RenderEngine';
 import { CityClock } from './engine/CityClock';
 import { CityLightSystem } from './engine/CityLightSystem';
+import { ContactShadowSystem } from './engine/ContactShadowSystem';
 import { LocomotionIK } from './actors/LocomotionIK';
 import { NPCController } from './actors/NPCController';
 import { InventorySystem } from './actors/InventorySystem';
@@ -138,6 +139,9 @@ const interiors = new InteriorSystem(prefabs, inventory, player);
 const combat = new CombatSystem(engine.scene, player, inventory, npcs, destruction, prefabs, events);
 const vehicles = new VehicleSystem(prefabs, grid, events, npcs, destruction);
 vehicles.setStreetActivity(cityClock.streetActivity);
+const contactShadows = new ContactShadowSystem(engine.scene, (x, z, y) => prefabs.supportHeight(x, z, y));
+events.on('terrainChanged', () => { engine.invalidateShadows(); contactShadows.invalidate(); });
+events.on('blast', () => engine.invalidateShadows());
 const clock = new THREE.Clock();
 const keys = new Set<string>();
 const touchAvailable = 'ontouchstart' in window || navigator.maxTouchPoints > 0 || matchMedia('(pointer: coarse)').matches;
@@ -858,13 +862,23 @@ function frame(): void {
     updateHud(dt);
   }
   npcs.renderActors();
+  contactShadows.beginFrame(player.group.position);
+  contactShadows.add(player.group, 1.3, 1.1);
+  for (const npc of npcs.npcs) if (!npc.ragdoll && !npc.offDuty) contactShadows.add(npc.group, 1.3, 1.1);
+  for (const car of prefabs.vehicles) {
+    if (car.userData.destroyed) continue;
+    const specs = car.userData.vehicle as { width: number; length: number };
+    contactShadows.add(car, specs.width * 1.08, specs.length * 0.96);
+  }
+  ragdolls.drawContactShadows(contactShadows);
+  contactShadows.endFrame(!engine.isWireframe);
   engine.render();
 }
 
 // Opt-in diagnostics for repeatable city/physics checks without adding HUD.
 if (new URLSearchParams(location.search).has('debug')) {
-  Object.assign(window, { __cityDebug: { engine, grid, prefabs, player, npcs, ragdolls, destruction, vehicles, setCameraMode } });
+  Object.assign(window, { __cityDebug: { engine, grid, prefabs, player, npcs, ragdolls, destruction, vehicles, contactShadows, cityClock, setCameraMode } });
 }
 frame();
 
-window.addEventListener('beforeunload', () => { npcs.dispose(); prefabs.dispose(); engine.dispose(); });
+window.addEventListener('beforeunload', () => { contactShadows.dispose(); npcs.dispose(); prefabs.dispose(); engine.dispose(); });

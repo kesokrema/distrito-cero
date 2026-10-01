@@ -31,6 +31,8 @@ import { createHumanoid } from '../src/actors/HumanoidModel';
 import { EventBus } from '../src/core/EventBus';
 import { DestructionSystem } from '../src/world/DestructionSystem';
 import { CityClock } from '../src/engine/CityClock';
+import { SunShadowState } from '../src/engine/SunShadowState';
+import { ContactShadowSystem } from '../src/engine/ContactShadowSystem';
 import { CANAL_BED_Y, CANAL_SURFACE_Y } from '../src/world/CanalWater';
 import { mixamoReferencePose, retargetMixamoClip } from '../src/actors/MixamoAnimationSystem';
 
@@ -172,8 +174,59 @@ test('city clock starts at a chosen hour and reduces street activity at night', 
   clock.hour = 23;
   assert.ok(clock.daylight < 0.1);
   assert.ok(clock.streetActivity < 0.4);
-  clock.update(900);
+  clock.update(3600);
   assert.ok(Math.abs(clock.hour - 23) < 1e-9, 'a full game day wraps to the same hour');
+  clock.update(60);
+  assert.ok(Math.abs(clock.hour - 23.4) < 1e-9, 'one real minute advances only 24 game minutes');
+});
+
+test('cached sunlight stays fixed within a solar minute and nearby camera movement', () => {
+  const sunlight = new SunShadowState();
+  const focus = new THREE.Vector3(1, 0, 1);
+  assert.equal(sunlight.update(focus, 12), true);
+  const initial = sunlight.offset.clone(), anchor = sunlight.center.clone();
+  for (let frame = 1; frame <= 120; frame++) {
+    focus.x = 1 + frame / 60;
+    assert.equal(sunlight.update(focus, 12 + frame / 60 * 24 / 3600), false);
+    assert.deepEqual(sunlight.center, anchor);
+    assert.deepEqual(sunlight.offset, initial);
+  }
+  assert.equal(sunlight.update(focus, 12 + 1 / 60), true, 'slow solar motion eventually refreshes');
+  const solarOffset = sunlight.offset.clone();
+  focus.x = 20;
+  assert.equal(sunlight.update(focus, 12 + 1 / 60), true, 'walking out of the shadow region refreshes the anchor');
+  assert.deepEqual(sunlight.offset, solarOffset, 'moving the shadow region does not turn the sun');
+});
+
+test('simple contact shadows share one mesh, rest on real floors and cache stationary support', () => {
+  const scene = new THREE.Scene();
+  let samples = 0, floor = 4.4;
+  const shadows = new ContactShadowSystem(scene, () => { samples++; return floor; }, 8);
+  const actor = new THREE.Group(); actor.position.set(3, floor, 2); scene.add(actor);
+  shadows.beginFrame(actor.position, 0);
+  shadows.add(actor, 1.3, 1.1);
+  shadows.endFrame();
+  assert.equal(shadows.mesh.count, 1);
+  assert.equal(shadows.mesh.geometry.index!.count, 6, 'two triangles per simple shadow');
+  assert.equal(shadows.mesh.castShadow, false);
+  assert.equal((shadows.mesh.material as THREE.Material).depthWrite, false);
+  assert.equal((shadows.mesh.material as THREE.Material).depthTest, true);
+  const matrix = new THREE.Matrix4(); shadows.mesh.getMatrixAt(0, matrix);
+  assert.ok(Math.abs(matrix.elements[13] - (floor + 0.035)) < 1e-6, 'shadow rests on the upper storey');
+  for (let i = 1; i <= 60; i++) {
+    shadows.beginFrame(actor.position, i / 60);
+    shadows.add(actor, 1.3, 1.1);
+  }
+  assert.equal(samples, 1, 'standing actors do not query floor geometry each frame');
+  floor = 0.07; shadows.invalidate(); actor.position.y = floor;
+  shadows.beginFrame(actor.position, 2); shadows.add(actor, 1.3, 1.1);
+  shadows.mesh.getMatrixAt(0, matrix);
+  assert.ok(Math.abs(matrix.elements[13] - (floor + 0.035)) < 1e-6, 'destroyed floors invalidate support');
+  actor.visible = false;
+  shadows.beginFrame(actor.position, 3); shadows.add(actor, 1.3, 1.1); shadows.endFrame();
+  assert.equal(shadows.mesh.count, 0);
+  assert.equal(shadows.mesh.visible, false);
+  shadows.dispose();
 });
 
 test('facial decal sits outside the rendered voxel head', () => {

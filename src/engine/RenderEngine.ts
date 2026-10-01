@@ -8,6 +8,7 @@ import { createWeaponModel } from '../actors/WeaponModel';
 import { voxelShape } from '../world/VoxelSystem';
 import { AtmosphereSystem } from './AtmosphereSystem';
 import type { CityClock } from './CityClock';
+import { SunShadowState } from './SunShadowState';
 
 export type CameraMode = 'isometric' | 'perspective' | 'firstPerson';
 
@@ -38,7 +39,9 @@ export class RenderEngine {
   private sun: THREE.DirectionalLight;
   private hemi: THREE.HemisphereLight;
   private skyFill: THREE.DirectionalLight;
-  private sunOffset = new THREE.Vector3(-34, 68, 26);
+  private readonly sunShadow = new SunShadowState();
+  private solarHour = 12;
+  private shadowDirty = true;
   private readonly atmosphere: AtmosphereSystem;
   private readonly viewWeapon = new THREE.Group();
   private viewTime = 0;
@@ -79,13 +82,14 @@ export class RenderEngine {
     this.sun = new THREE.DirectionalLight('#ffd29b', 2.84);
     this.sun.position.set(-34, 68, 26);
     this.sun.castShadow = true;
-    // A 1024² map is enough for the current 84-unit shadow camera and cuts
+    // A 1024² map is enough for the city's voxel scale and cuts
     // the expensive full-scene shadow pass to a quarter of its former pixels.
     this.sun.shadow.mapSize.set(1024, 1024);
-    this.sun.shadow.camera.left = -42;
-    this.sun.shadow.camera.right = 42;
-    this.sun.shadow.camera.top = 42;
-    this.sun.shadow.camera.bottom = -42;
+    // Include the margin needed while the cached projection stays anchored.
+    this.sun.shadow.camera.left = -56;
+    this.sun.shadow.camera.right = 56;
+    this.sun.shadow.camera.top = 56;
+    this.sun.shadow.camera.bottom = -56;
     this.sun.shadow.bias = -0.00025;
     this.sun.shadow.normalBias = 0.018;
     this.scene.add(this.sun);
@@ -156,10 +160,11 @@ export class RenderEngine {
     this.skyFill.intensity = 0.16 + ambient * 0.16;
     this.sun.intensity = 0.22 + day * 2.62 + sunset * 0.55;
     this.sun.color.set('#ffd29b').lerp(new THREE.Color('#ff9968'), sunset * 0.66);
-    this.sun.castShadow = day > 0.13 || sunset > 0.3;
+    const castsShadow = day > 0.13 || sunset > 0.3;
+    if (this.sun.castShadow !== castsShadow) this.shadowDirty = true;
+    this.sun.castShadow = castsShadow;
     this.renderer.toneMappingExposure = 0.96 + ambient * 0.18;
-    const angle = clock.hour * Math.PI / 12;
-    this.sunOffset.set(Math.cos(angle) * 50, 15 + 55 * Math.max(0.05, Math.sin((clock.hour - 6) * Math.PI / 12)), Math.sin(angle) * 38);
+    this.solarHour = clock.hour;
     this.atmosphere.setTimeOfDay(day, sunset);
   }
 
@@ -402,8 +407,6 @@ export class RenderEngine {
       this.camera.position.copy(eye);
       this.camera.lookAt(eye.add(direction));
     }
-    this.sun.target.position.copy(this.cameraTarget);
-    this.sun.position.copy(this.cameraTarget).add(this.sunOffset);
     this.atmosphere.update(dt, this.cameraTarget, this.mode);
   }
 
@@ -441,14 +444,19 @@ export class RenderEngine {
 
   get isWireframe(): boolean { return this.wireframeEnabled; }
 
+  invalidateShadows(): void { this.shadowDirty = true; }
+
   render(): void {
-    // Static city shadows need not redraw the full scene on every frame.
     const now = performance.now();
-    // Refresh dynamic shadows at a lower cadence. Rebuilding the shadow map
-    // every 250 ms caused a visible GPU hitch on otherwise steady frames.
-    if (now - this.lastShadowUpdate >= (this.mobile ? 900 : 750)) {
-      this.renderer.shadowMap.needsUpdate = true;
+    if (this.sunShadow.update(this.cameraTarget, this.solarHour)) this.shadowDirty = true;
+    // Keep both the light and its shadow projection fixed between refreshes.
+    // Static shadows change only with the solar minute, camera region or damage.
+    if (this.shadowDirty && now - this.lastShadowUpdate >= 150) {
+      this.sun.target.position.copy(this.sunShadow.center);
+      this.sun.position.copy(this.sunShadow.center).add(this.sunShadow.offset);
+      if (this.sun.castShadow) this.renderer.shadowMap.needsUpdate = true;
       this.lastShadowUpdate = now;
+      this.shadowDirty = false;
     }
     this.renderer.info.reset();
     const start = performance.now();

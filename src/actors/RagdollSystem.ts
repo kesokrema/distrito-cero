@@ -6,6 +6,7 @@ import { voxelShape } from '../world/VoxelSystem';
 import type { BodyPart } from './HumanoidModel';
 import { createFaceDecal, setFaceExpression, type FaceExpression } from './FaceTextures';
 import { sampleJointMotion, type JointMotion } from './JointAnimation';
+import type { ContactShadowSystem } from '../engine/ContactShadowSystem';
 
 type Joint = { position: THREE.Vector3; previous: THREE.Vector3 };
 type Link = { a: number; b: number; length: number; mesh: THREE.Mesh; part: BodyPart; baseMaterial: THREE.Material };
@@ -131,7 +132,7 @@ export class RagdollSystem {
       if (missing.has(part)) return;
       const length = joints[a].position.distanceTo(joints[b].position);
       const mesh = voxelShape(width * size, visibleHeight ? visibleHeight * size : length, depth * size, material);
-      mesh.castShadow = true;
+      mesh.castShadow = false;
       this.scene.add(mesh);
       links.push({ a, b, length, mesh, part, baseMaterial: material });
       constrain(a, b, part);
@@ -162,7 +163,7 @@ export class RagdollSystem {
     const details = [voxelShape(0.58 * size, 0.58 * size, 0.58 * size, palette.skin)];
     const face = createFaceDecal('scared');
     details[0].add(face);
-    details.forEach((mesh) => { mesh.castShadow = true; this.scene.add(mesh); });
+    details.forEach((mesh) => { mesh.castShadow = false; this.scene.add(mesh); });
     const body: RagdollBody = { joints, links, constraints, details, face, woundMarks: [], materials: Object.values(palette), age: 0, life, floorLevel, size,
       missing: new Set(missing), crawling: false, crawlDirection: new THREE.Vector3(0, 0, 1).applyAxisAngle(Y_AXIS, yaw), crawlAge: 0,
       across: new THREE.Vector3(1, 0, 0).applyAxisAngle(Y_AXIS, yaw) };
@@ -174,6 +175,13 @@ export class RagdollSystem {
   }
 
   pelvis(body: RagdollBody): THREE.Vector3 { return body.joints[0].position; }
+  drawContactShadows(shadows: ContactShadowSystem): void {
+    for (const body of this.bodies) {
+      const torso = body.links.find(link => link.part === 'torso');
+      if (torso) shadows.add(torso.mesh, body.size * 1.1, body.size * 2,
+        Math.atan2(body.crawlDirection.x, body.crawlDirection.z));
+    }
+  }
   active(body: RagdollBody): boolean { return this.bodies.includes(body); }
   recoveryFinished(body: RagdollBody): boolean { return (body.recovery?.elapsed || 0) >= 1.05; }
 
