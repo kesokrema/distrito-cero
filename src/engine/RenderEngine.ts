@@ -79,7 +79,9 @@ export class RenderEngine {
     this.sun = new THREE.DirectionalLight('#ffd29b', 2.84);
     this.sun.position.set(-34, 68, 26);
     this.sun.castShadow = true;
-    this.sun.shadow.mapSize.set(this.mobile ? 1024 : 2048, this.mobile ? 1024 : 2048);
+    // A 1024² map is enough for the current 84-unit shadow camera and cuts
+    // the expensive full-scene shadow pass to a quarter of its former pixels.
+    this.sun.shadow.mapSize.set(1024, 1024);
     this.sun.shadow.camera.left = -42;
     this.sun.shadow.camera.right = 42;
     this.sun.shadow.camera.top = 42;
@@ -442,7 +444,9 @@ export class RenderEngine {
   render(): void {
     // Static city shadows need not redraw the full scene on every frame.
     const now = performance.now();
-    if (now - this.lastShadowUpdate >= (this.mobile ? 350 : 250)) {
+    // Refresh dynamic shadows at a lower cadence. Rebuilding the shadow map
+    // every 250 ms caused a visible GPU hitch on otherwise steady frames.
+    if (now - this.lastShadowUpdate >= (this.mobile ? 900 : 750)) {
       this.renderer.shadowMap.needsUpdate = true;
       this.lastShadowUpdate = now;
     }
