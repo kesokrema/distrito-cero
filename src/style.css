@@ -54,6 +54,8 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .crosshair.shown { opacity: 1; }
 .toast { position: absolute; left: 50%; bottom: 63px; transform: translate(-50%, 10px); padding: 10px 15px; background: rgba(17, 34, 45, .9); border: 1px solid #5ee0d1; color: #dbfff9; font-size: 11px; letter-spacing: .4px; opacity: 0; transition: opacity .2s, transform .2s; pointer-events: none; white-space: nowrap; }
 .toast.visible { opacity: 1; transform: translate(-50%, 0); }.toast.danger { border-color: #ff7870; color: #ffe0d8; }.toast.success { border-color: #a8d671; color: #e8ffdc; }
+.toast { width: max-content; max-width: min(520px, calc(100vw - 32px)); white-space: normal; text-align: center; }
+.toast.visible + .interaction-prompt { visibility: hidden; }
 .overlay { position: absolute; inset: 0; z-index: 10; background: rgba(10, 23, 32, .65); backdrop-filter: blur(7px); display: grid; place-items: center; }
 .overlay.hidden { display: none; }.overlay-card { width: min(90vw, 390px); padding: 28px; background: #182b37; border: 1px solid #73979a; border-radius: 12px; text-align: center; box-shadow: 0 20px 50px #06111899; }
 .overlay-card h1 { font-family: 'Barlow Condensed', sans-serif; font-size: 48px; letter-spacing: 1px; margin: 0; }.overlay-card p { font-size: 12px; line-height: 1.6; color: #b9c9ca; margin: 8px 0 25px; }
@@ -403,3 +405,10 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
   #app[data-input-mode="touch"] .mobile-actions #mobile-fire { height:45px;width:62px; }
   #app[data-input-mode="touch"] .toast,#app[data-input-mode="touch"] .interaction-prompt { bottom:115px; }
 }
+
+.quality-control { padding: 7px 10px; border: 1px solid #86a9a2; border-radius: 5px; color: #eafff5; background: #203e47; cursor: pointer; font: inherit; }
+
+#app[data-input-mode="touch"] .controls.open { display: grid !important; }
+#app[data-input-mode="touch"] .hud-right { width: auto; max-width: calc(100vw - 190px); gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+#app[data-input-mode="touch"] .hud-right .stat-block { flex-shrink: 0; }
+#app[data-input-mode="touch"] .city-time { flex-basis: 100%; text-align: right; font-size: 9px; }

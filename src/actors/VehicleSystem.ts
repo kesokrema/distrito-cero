@@ -44,14 +44,18 @@ export class VehicleSystem {
   private playerImpactCooldown = 0;
   private readonly vehicleSpatial = new SpatialHash<THREE.Group>(7, (vehicle) => vehicle.position);
   private streetActivity = 1;
+  private readonly unsubscribers:Array<()=>void>=[];
+  private exitClear:((position:THREE.Vector3)=>boolean)|null=null;
+  setExitClear(test:(position:THREE.Vector3)=>boolean):void{this.exitClear=test;}
+  dispose():void{this.unsubscribers.forEach(off=>off());this.unsubscribers.length=0;this.traffic.clear();this.impactMotion.clear();this.lastHit.clear();}
 
   setStreetActivity(activity: number): void { this.streetActivity = THREE.MathUtils.clamp(activity, 0.2, 1); }
 
   constructor(private prefabs: PrefabManager, private grid: GridSystem, private events: EventBus, private npcs: NPCController,
     private destruction: DestructionSystem) {
-    events.on('gunshot', ({ x, z, radius }) => this.alarmTraffic(x, z, radius));
-    events.on('enemyShot', ({ fromX, fromZ }) => this.alarmTraffic(fromX, fromZ, 22));
-    events.on('blast', ({ x, z, radius }) => this.alarmTraffic(x, z, radius * 2));
+    this.unsubscribers.push(events.on('gunshot', ({ x, z, radius }) => this.alarmTraffic(x, z, radius)));
+    this.unsubscribers.push(events.on('enemyShot', ({ fromX, fromZ }) => this.alarmTraffic(fromX, fromZ, 22)));
+    this.unsubscribers.push(events.on('blast', ({ x, z, radius }) => this.alarmTraffic(x, z, radius * 2)));
   }
 
   private alarmTraffic(x: number, z: number, radius: number): void {
@@ -311,14 +315,19 @@ export class VehicleSystem {
     if (this.active) {
       if (Math.abs(this.speed) > 1.3) return 'DETÉN EL VEHÍCULO PARA SALIR';
       const car = this.active;
-      const side = new THREE.Vector3(2.3, 0, 0).applyAxisAngle(new THREE.Vector3(0, 1, 0), car.rotation.y);
-      const options = [car.position.clone().add(side), car.position.clone().sub(side)];
-      const exit = options.find((point) => this.grid.walkable(point.x, point.z));
+      const specs=car.userData.vehicle as {width:number;length:number};
+      const side = new THREE.Vector3(specs.width/2+.7, 0, 0).applyAxisAngle(new THREE.Vector3(0, 1, 0), car.rotation.y);
+      const rear=new THREE.Vector3(0,0,-specs.length/2-.7).applyAxisAngle(new THREE.Vector3(0,1,0),car.rotation.y);
+      const options = [car.position.clone().add(side), car.position.clone().sub(side),car.position.clone().add(rear)];
+      for(const option of options)option.y=this.grid.groundHeight(option.x,option.z);
+      const exit = options.find((point) => this.grid.walkable(point.x, point.z)&&(!this.exitClear||this.exitClear(point)));
       if (!exit) return 'NO HAY ESPACIO PARA SALIR';
       player.group.position.copy(exit);
+      player.velocity?.set(0,0,0);
       player.group.visible = true;
       const parkedCells = this.prefabs.setVehicleParked(car, true);
       if (parkedCells.length) this.events.emit('terrainChanged', { cells: parkedCells });
+      car.userData.playerDriving=false;
       this.active = null;
       this.speed = 0;
       this.steering = 0;
@@ -329,7 +338,7 @@ export class VehicleSystem {
     const parkedCells = this.prefabs.setVehicleParked(car, false);
     if (parkedCells.length) this.events.emit('terrainChanged', { cells: parkedCells });
     this.prefabs.releaseVehicle(car);
-    this.active = car;
+    this.active = car;car.userData.playerDriving=true;
     this.speed = 0;
     this.steering = 0;
     player.group.visible = false;
@@ -345,6 +354,7 @@ export class VehicleSystem {
       stepVehicleSuspension(car,dt,(x,z)=>this.grid.groundHeight(x,z));
     player.group.position.copy(car.position);
       player.group.visible = true;
+      car.userData.playerDriving=false;
       this.active = null;
       this.speed = 0;
       this.steering = 0;

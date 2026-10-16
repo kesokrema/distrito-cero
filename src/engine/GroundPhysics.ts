@@ -12,6 +12,10 @@ export class GroundPhysics {
     return true;
   }
   get verticalSpeed():number {return this.velocityY;}
+  contact(grounded: boolean, ceiling: boolean):void {
+    if(grounded && this.velocityY<0){this.velocityY=0;this.grounded=true;}
+    if(ceiling && this.velocityY>0)this.velocityY=0;
+  }
   step(y:number,floor:number,dt:number):number {
     const steps=Math.max(1,Math.ceil(Math.min(dt,.1)*120)),h=Math.min(dt,.1)/steps;
     for(let i=0;i<steps;i++) {

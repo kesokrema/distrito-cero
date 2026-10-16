@@ -237,7 +237,7 @@ export class MixamoAnimationSystem {
       actor.action.setLoop(THREE.LoopRepeat, Infinity);
       actor.clipId = clipId;
     }
-    actor.mixer.update(Math.min(dt, 0.05));
+    actor.mixer.update(Math.min(dt, .15));
     return true;
   }
 
@@ -259,6 +259,10 @@ export class MixamoAnimationSystem {
     return undefined;
   }
 
+  remove(root:THREE.Group):void {
+    const actor=this.actors.get(root);if(!actor)return;
+    actor.mixer.stopAllAction();actor.mixer.uncacheRoot(root);this.actors.delete(root);
+  }
   dispose(): void {
     for (const actor of this.actors.values()) actor.mixer.stopAllAction();
     this.actors.clear(); this.clips.clear(); this.stateClips.clear(); this.referencePose.clear();

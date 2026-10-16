@@ -4,11 +4,13 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { SSAOPass } from 'three/addons/postprocessing/SSAOPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import type { Weapon } from '../actors/InventorySystem';
-import { createWeaponModel } from '../actors/WeaponModel';
+import { createWeaponModel, disposeWeaponModel } from '../actors/WeaponModel';
 import { voxelShape } from '../world/VoxelSystem';
 import { AtmosphereSystem } from './AtmosphereSystem';
 import type { CityClock } from './CityClock';
 import { SunShadowState } from './SunShadowState';
+import { RenderQuality, QUALITY, type QualityMode } from './RenderQuality';
+import {GpuTimer} from './GpuTimer';
 
 export type CameraMode = 'isometric' | 'perspective' | 'firstPerson';
 
@@ -19,6 +21,8 @@ export class RenderEngine {
   camera: THREE.OrthographicCamera | THREE.PerspectiveCamera = this.isometricCamera;
   mode: CameraMode = 'isometric';
   readonly renderer: THREE.WebGLRenderer;
+  readonly gpuTimer:GpuTimer;
+  onGpuTime:((ms:number)=>void)|null=null;
   readonly raycaster = new THREE.Raycaster();
   private cameraTarget = new THREE.Vector3();
   private cameraOffset = new THREE.Vector3();
@@ -33,6 +37,9 @@ export class RenderEngine {
   private collisionProbe: ((from: THREE.Vector3, to: THREE.Vector3) => number | null) | null = null;
   private collisionTime = 0;
   private collisionDistance: number | null = null;
+  private cameraSweep: ((from: THREE.Vector3, to: THREE.Vector3, radius: number) => THREE.Vector3) | null = null;
+  private eyeY = NaN;
+  setCameraSweep(sweep: (from: THREE.Vector3, to: THREE.Vector3, radius: number) => THREE.Vector3): void { this.cameraSweep = sweep; }
   private readonly composer: EffectComposer;
   private readonly renderPass: RenderPass;
   private readonly ssao: SSAOPass;
@@ -44,6 +51,8 @@ export class RenderEngine {
   private shadowDirty = true;
   private readonly atmosphere: AtmosphereSystem;
   private readonly viewWeapon = new THREE.Group();
+  private readonly viewScene = new THREE.Scene();
+  private readonly viewCamera = new THREE.PerspectiveCamera(62,1,.02,10);
   private viewTime = 0;
   private ads = false;
   private lastViewWeapon: Weapon = 'fists';
@@ -61,6 +70,27 @@ export class RenderEngine {
   private adaptiveAO = true;
   private renderCost = 0;
   private renderedFrames = 0;
+  readonly quality = new RenderQuality(this.mobile, this.qualityFromUrl());
+  private readonly onResize = ():void=>this.resize();
+  private qualityFromUrl():QualityMode {
+    const mode=new URLSearchParams(location.search).get('quality');
+    return mode==='low'||mode==='medium'||mode==='high'?mode:'auto';
+  }
+  get viewDistance():number{return QUALITY[this.quality.level].viewDistance;}
+  setQuality(mode:QualityMode):void {this.quality.set(mode);this.applyQuality();}
+  adaptQuality(frameMs:number,elapsed:number,busy:boolean):void {
+    if(this.quality.sample(frameMs,elapsed,busy))this.applyQuality();
+  }
+  private applyQuality():void {
+    const config=QUALITY[this.quality.level];
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio,config.pixelRatio));
+    this.renderer.shadowMap.enabled=config.shadows;
+    if(this.sun.shadow.mapSize.x!==config.shadowSize) {
+      this.sun.shadow.mapSize.set(config.shadowSize,config.shadowSize);
+      this.sun.shadow.map?.dispose();this.sun.shadow.map=null;
+    }
+    this.invalidateShadows();this.resize();
+  }
 
   constructor(container: HTMLElement) {
     // A pale blue-green haze keeps the far blocks readable while giving the
@@ -68,6 +98,7 @@ export class RenderEngine {
     this.scene.background = new THREE.Color('#b8c9c4');
     this.scene.fog = new THREE.Fog('#b8c9c4', 145, 300);
     this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+    this.gpuTimer=new GpuTimer(this.renderer.getContext() as WebGL2RenderingContext,new URLSearchParams(location.search).has('debug'),ms=>this.onGpuTime?.(ms));
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, this.mobile ? 1 : 1.25));
     this.renderer.info.autoReset = false;
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -98,7 +129,8 @@ export class RenderEngine {
     this.skyFill.position.set(26, 35, -31);
     this.scene.add(this.skyFill);
     this.atmosphere = new AtmosphereSystem(this.scene);
-    this.perspectiveCamera.add(this.viewWeapon);
+    this.viewCamera.add(this.viewWeapon);
+    this.viewScene.add(this.viewCamera,new THREE.HemisphereLight('#e5efff','#596d47',2));
     this.viewWeapon.scale.setScalar(0.62);
     this.scene.add(this.perspectiveCamera);
     this.setViewWeapon('pistol');
@@ -124,7 +156,8 @@ export class RenderEngine {
     this.composer.addPass(this.ssao);
     this.composer.addPass(new OutputPass());
     this.resize();
-    window.addEventListener('resize', () => this.resize());
+    this.applyQuality();
+    window.addEventListener('resize', this.onResize);
   }
 
   resize(): void {
@@ -139,6 +172,7 @@ export class RenderEngine {
     this.isometricCamera.updateProjectionMatrix();
     this.perspectiveCamera.aspect = aspect;
     this.perspectiveCamera.updateProjectionMatrix();
+    this.viewCamera.aspect=aspect;this.viewCamera.updateProjectionMatrix();
     this.renderer.setSize(width, height);
     this.composer.setSize(width, height);
     // AO is blurred before composition, so its internal buffers can be smaller
@@ -189,6 +223,7 @@ export class RenderEngine {
     this.orbitHold = 0;
     this.collisionTime = 0;
     this.cameraTarget.copy(position);
+    this.eyeY = NaN;
     this.camera = mode === 'isometric' ? this.isometricCamera : this.perspectiveCamera;
     this.renderPass.camera = this.camera;
     this.ssao.camera = this.camera;
@@ -204,7 +239,7 @@ export class RenderEngine {
     // forward() points toward -sin(yaw); reducing yaw turns the view right.
     this.yaw -= deltaX * 0.006;
     if (this.mode === 'isometric') this.isometricYaw = this.yaw;
-    if (this.mode === 'firstPerson') this.pitch = THREE.MathUtils.clamp(this.pitch - deltaY * 0.004, -1.2, 1.2);
+    if (this.mode === 'firstPerson') this.pitch = THREE.MathUtils.clamp(this.pitch - deltaY * 0.004, -1.48, 1.48);
     else if (this.mode === 'perspective') this.thirdHeight = THREE.MathUtils.clamp(this.thirdHeight + deltaY * 0.022, 2.1, 7);
     else this.updateCameraOffset();
     this.orbitHold = 2.5;
@@ -228,6 +263,7 @@ export class RenderEngine {
   setViewWeapon(weapon: Weapon, visible = true): void {
     this.viewWeapon.scale.setScalar(weapon === 'charge' ? 0.34 : 0.62);
     if (weapon !== this.lastViewWeapon) {
+      disposeWeaponModel(this.viewWeapon);
       this.viewWeapon.clear();
       this.lastViewWeapon = weapon;
       const gun = createWeaponModel(weapon);
@@ -366,7 +402,7 @@ export class RenderEngine {
   follow(position: THREE.Vector3, dt: number, vehicleHeading: number | null = null, vehicle: THREE.Group | null = null, steering = 0): void {
     this.syncCockpit(vehicle, steering);
     this.orbitHold = Math.max(0, this.orbitHold - dt);
-    if (this.mode !== 'isometric' && vehicleHeading !== null && this.orbitHold === 0) {
+    if (this.mode === 'perspective' && vehicleHeading !== null && this.orbitHold === 0) {
       const targetYaw = vehicleHeading + Math.PI;
       this.yaw += Math.atan2(Math.sin(targetYaw - this.yaw), Math.cos(targetYaw - this.yaw)) * Math.min(1, dt * 2.2);
     }
@@ -391,7 +427,7 @@ export class RenderEngine {
         const safeDistance = Math.max(0.12, Math.min(ray.length(), this.collisionDistance - 0.3));
         desired.copy(anchor).addScaledVector(ray.normalize(), safeDistance);
       }
-      this.camera.position.copy(desired);
+      this.camera.position.copy(this.cameraSweep ? this.cameraSweep(anchor, desired, .22) : desired);
       this.camera.lookAt(anchor.addScaledVector(forward, vehicle ? 3 : 6));
     } else {
       const forward = this.forward();
@@ -402,6 +438,14 @@ export class RenderEngine {
         const seat = this.seatFor(vehicle);
         eye.x += Math.cos(vehicle.rotation.y) * seat.x + Math.sin(vehicle.rotation.y) * seat.z;
         eye.z += -Math.sin(vehicle.rotation.y) * seat.x + Math.cos(vehicle.rotation.y) * seat.z;
+      }
+      const targetY=eye.y;
+      if(!Number.isFinite(this.eyeY)||vehicle||Math.abs(this.eyeY-targetY)>1.1)this.eyeY=targetY;
+      else if(dt>0)this.eyeY=THREE.MathUtils.lerp(this.eyeY,targetY,1-Math.exp(-dt*22));
+      eye.y=this.eyeY;
+      if(this.cameraSweep) {
+        const anchor=new THREE.Vector3(eye.x,position.y+Math.min(1.1,targetY-position.y),eye.z);
+        eye.copy(this.cameraSweep(anchor,eye,.12));
       }
       const direction = forward.multiplyScalar(Math.cos(this.pitch)).add(new THREE.Vector3(0, Math.sin(this.pitch), 0));
       this.camera.position.copy(eye);
@@ -447,6 +491,7 @@ export class RenderEngine {
   invalidateShadows(): void { this.shadowDirty = true; }
 
   render(): void {
+    this.gpuTimer.begin();
     const now = performance.now();
     if (this.sunShadow.update(this.cameraTarget, this.solarHour)) this.shadowDirty = true;
     // Keep both the light and its shadow projection fixed between refreshes.
@@ -473,14 +518,23 @@ export class RenderEngine {
         this.scene.overrideMaterial = override;
       }
     }
+    if(this.mode==='firstPerson'&&this.viewWeapon.visible) {
+      const autoClear=this.renderer.autoClear;
+      this.renderer.autoClear=false;this.renderer.clearDepth();
+      this.renderer.render(this.viewScene,this.viewCamera);this.renderer.autoClear=autoClear;
+    }
     // Voxel corner AO is baked into the chunk mesh at every quality level.
     // Drop only the extra screen-space passes when they exceed the frame
     // budget on a slow GPU/driver; explicit ?ao=1 remains useful for comparison.
     this.renderCost = this.renderCost * .95 + (performance.now() - start) * .05;
     if (++this.renderedFrames > 80 && this.adaptiveAO && this.renderCost > 16) this.ssao.enabled = false;
+    this.gpuTimer.end();
   }
   dispose(): void {
+    this.gpuTimer.dispose();
+    window.removeEventListener('resize',this.onResize);
     this.atmosphere.dispose();
+    disposeWeaponModel(this.viewWeapon);this.ssao.dispose();this.sun.shadow.map?.dispose();
     this.viewCloth.dispose(); this.viewSkin.dispose(); this.wireframeMaterial.dispose();
     this.composer.dispose(); this.renderer.dispose();
   }

@@ -9,6 +9,15 @@ const mat = (hex: string): THREE.MeshStandardMaterial => {
   return item;
 };
 
+/** Most cuboids share cached geometry/materials; only the launcher owns these. */
+export function disposeWeaponModel(root:THREE.Object3D):void {
+  root.traverse(object=>{
+    if(!(object instanceof THREE.Mesh)||!object.userData.privateWeaponGeometry)return;
+    object.geometry.dispose();
+    for(const material of Array.isArray(object.material)?object.material:[object.material])material.dispose();
+  });
+}
+
 /** Block-built firearm shared by the world character and the first-person view. */
 export function createWeaponModel(kind: Weapon): THREE.Group {
   const root = new THREE.Group();
@@ -41,6 +50,7 @@ export function createWeaponModel(kind: Weapon): THREE.Group {
       new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.72, metalness: 0.24 }));
     launcher.position.set(0, -0.08, 0.66);
     launcher.castShadow = false;
+    launcher.userData.privateWeaponGeometry=true;
     launcher.userData.voxelSize = VOXEL_SIZE;
     root.add(launcher);
     return root;

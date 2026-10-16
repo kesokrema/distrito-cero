@@ -1,6 +1,7 @@
 import { UrbanLandscape } from './UrbanLandscape';
 import { natureTree, naturePatch } from './NaturePrefabs';
 import * as THREE from 'three';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { GridSystem, type BlockBounds, type Cell, type District } from './GridSystem';
 import { VOXEL_SIZE, VOXELS_PER_CELL, voxelCuboid, voxelSurfaceGeometry, type VoxelDimensions } from './VoxelSystem';
 import { CITY_VOXEL_SIZE, CITY_VOXELS_PER_CELL, CITY_VOXELS_PER_FLOOR, FLOOR_HEIGHT } from './VoxelConstants';
@@ -11,11 +12,12 @@ import { roomParts } from './RoomFurnishings';
 import { buildingArchitecture, WALL_DIRECTIONS } from './BuildingArchitecture';
 import { createHumanoid } from '../actors/HumanoidModel';
 import { MERGED_VOXEL_OWNER } from './GreedyMesher';
-import { meshVoxelCells } from './GreedyMesher';
 import { meshTerrainSurface, meshTerrainBanks } from './SurfacePatches';
 import { animateCanalFlow, CANAL_BED_Y, CANAL_SURFACE_Y } from './CanalWater';
-import { meshVoxelDecorations, snapVoxelMeshToGrid } from './VoxelDecorationMesher';
+import { snapVoxelMeshToGrid } from './VoxelDecorationMesher';
 import { createRoofFeatureMesh, type RoofVoxel } from './RoofPrefabRenderer';
+import type { AddCollisionBox } from '../engine/CollisionWorld';
+import type {GroundCover,GroundRequest,GroundResult} from './GroundMesher';
 
 export interface Voxel {
   x: number; y: number; z: number; alive: boolean; hp: number; cellIndex: number; color: THREE.Color; voxelSize: number;
@@ -70,7 +72,7 @@ type FarMeshResult = {
 };
 type MeshRequest = { assets: BlockAssets; region: ShellRegion; revision: number };
 type DecorationPieceStatic = { nx: number; ny: number; nz: number; voxelSize: number; tint: readonly [number, number, number]; matrixWorld: Float32Array };
-type StaticAggregateState = { mesh: THREE.Mesh; pieces: InteriorPiece[]; revision: number; pending: boolean; workerPieces?: DecorationPieceStatic[] };
+type StaticAggregateState = { mesh: THREE.Mesh; pieces: InteriorPiece[]; revision: number; pending: boolean; gridSize?: number; latticeOffset?: number[]; workerPieces?: DecorationPieceStatic[] };
 type DecorationMeshResult = { id: number; revision: number; positions: Float32Array; normals: Float32Array; colors: Float32Array;
   indexes: Uint32Array; voxelForFace: Uint32Array; exposedFaces: number; quads: number };
 type DecorationMeshRequest = { state: StaticAggregateState; revision: number };
@@ -171,6 +173,7 @@ function signFace(text: string, background: string, foreground: string, width: n
 }
 
 export class PrefabManager {
+  viewDistance=155;
   readonly voxels: Voxel[] = [];
   readonly buildings = new THREE.Group();
   readonly interactiveProps: InteractiveProp[] = [];
@@ -187,6 +190,12 @@ export class PrefabManager {
   private aggregatePiecesByMesh = new WeakMap<THREE.Mesh, InteriorPiece[]>();
   private staticBatchMaterials = new Map<string, THREE.MeshStandardMaterial>();
   private interiorPiecesByCell = new Map<number, InteriorPiece[]>();
+  private readonly collisionPiecesByCell = new Map<number, InteriorPiece[]>();
+  private readonly collisionLocalBounds = new THREE.Box3();
+  private readonly collisionVoxelBounds = new THREE.Box3();
+  private readonly collisionSeen = new Set<InteriorPiece>();
+  private readonly collisionBlocks=new Set<string>();
+  private readonly collisionColumns=new WeakMap<Float32Array,Map<number,number[]>>();
   private navigationChanges = new Set<number>();
   private vehicleParts = new WeakMap<THREE.Group, InteriorPiece[]>();
   private upperFloorSlabsByCell = new Map<number, InteriorPiece[]>();
@@ -205,8 +214,14 @@ export class PrefabManager {
   private readonly damagedPavementVoxels = new Map<string, number>();
   private groundVisible = true;
   private readonly dirtyGround = new Set<THREE.Mesh>();
+  private groundWorker:Worker;
+  private nextGroundRequest=1;
+  private readonly groundRequests=new Map<number,{ground:THREE.Mesh;revision:number}>();
+  private readonly completedGround:GroundResult[]=[];
   private meshWorker: Worker;
   private decorationWorker: Worker;
+  private readonly completedShells: FarMeshResult[]=[];
+  private readonly completedDecorations: DecorationMeshResult[]=[];
   private nextMeshRequest = 1;
   private nextDecorationRequest = 1;
   private meshRequests = new Map<number, MeshRequest>();
@@ -215,6 +230,8 @@ export class PrefabManager {
   private landmarkCell: Cell;
   private pendingBlock: Generator<void, BlockBounds> | null = null;
   private visibleCenter = '';
+  private simulationBX=0;
+  private simulationBZ=0;
   private readonly plansByBlock = new Map<string, BuildingPlan[]>();
   private readonly viewFrustum = new THREE.Frustum();
   private readonly viewMatrix = new THREE.Matrix4();
@@ -230,7 +247,7 @@ export class PrefabManager {
     return base.offsetHSL(hue, (profile.density - 0.5) * 0.085, (profile.greenery - 0.5) * 0.055);
   }
 
-  constructor(private scene: THREE.Scene, readonly grid: GridSystem, private streetActivity = 1) {
+  constructor(private scene: THREE.Scene, readonly grid: GridSystem, private streetActivity = 1, deferStartup=false) {
     if (Math.abs(grid.cellSize - VOXELS_PER_CELL * VOXEL_SIZE) > 1e-9) throw new Error('La celda debe contener un número entero de voxels estándar');
     // Tint the exposed shell by its real world-lattice cell in the material.
     // Greedy walls stay as two triangles while individual voxels retain a
@@ -264,9 +281,11 @@ export class PrefabManager {
                                    1.0 + tone - warm * 0.05 * detail);`);
     };
     this.meshWorker = new Worker(new URL('../workers/mesh.worker.ts', import.meta.url), { type: 'module' });
-    this.meshWorker.onmessage = (event: MessageEvent<FarMeshResult>) => this.receiveFarMesh(event.data);
+    this.meshWorker.onmessage = (event: MessageEvent<FarMeshResult>) => this.completedShells.push(event.data);
     this.decorationWorker = new Worker(new URL('../workers/decoration.worker.ts', import.meta.url), { type: 'module' });
-    this.decorationWorker.onmessage = (event: MessageEvent<DecorationMeshResult>) => this.receiveDecorationMesh(event.data);
+    this.decorationWorker.onmessage = (event: MessageEvent<DecorationMeshResult>) => this.completedDecorations.push(event.data);
+    this.groundWorker=new Worker(new URL('../workers/ground.worker.ts',import.meta.url),{type:'module'});
+    this.groundWorker.onmessage=(event:MessageEvent<GroundResult>)=>this.completedGround.push(event.data);
     scene.add(this.buildings);
     // Fix the entire city's parcel/building blueprint before any detailed
     // chunk geometry is built. The geometry and occupants remain streamed.
@@ -277,7 +296,7 @@ export class PrefabManager {
     }
     this.landmarkCell = grid.landmark('park');
     const spawn = grid.blockAt(grid.center + 1, grid.center + 1);
-    this.ensureAround(spawn.bx, spawn.bz, 1, Infinity);
+    if(!deferStartup)this.ensureAround(spawn.bx, spawn.bz, 1, Infinity);
   }
 
   setStreetActivity(activity: number): void { this.streetActivity = THREE.MathUtils.clamp(activity, 0.2, 1); }
@@ -298,6 +317,7 @@ export class PrefabManager {
   }
 
   dispose(): void {
+    this.groundWorker.terminate();
     this.meshWorker.terminate();
     this.decorationWorker.terminate();
     for (const assets of this.blockAssets.values()) for (const region of assets.regions.values()) region.mesh?.geometry.dispose();
@@ -305,8 +325,8 @@ export class PrefabManager {
     this.shellMaterial.dispose();
   }
 
-  ensureAround(bx: number, bz: number, radius = 2, maxBlocks = 1): BlockBounds[] {
-    const deadline = maxBlocks === Infinity ? Infinity : performance.now() + 4;
+  ensureAround(bx: number, bz: number, radius = 2, maxBlocks = 1, budgetMs=2): BlockBounds[] {
+    const deadline = maxBlocks === Infinity ? Infinity : performance.now() + budgetMs;
     const generated: BlockBounds[] = [];
     while (generated.length < maxBlocks && performance.now() < deadline) {
       if (!this.pendingBlock) {
@@ -364,7 +384,7 @@ export class PrefabManager {
     collect(cameraBlock.bx, cameraBlock.bz, 5);
     candidates.sort((a, b) => a.score - b.score);
     const generated: BlockBounds[] = [];
-    const deadline = performance.now() + 4;
+    const deadline = performance.now() + 2;
     while (generated.length < maxBlocks && performance.now() < deadline) {
       if (!this.pendingBlock) {
         const next = candidates.shift();
@@ -388,7 +408,7 @@ export class PrefabManager {
     const [x0, z0] = this.grid.world(bounds.x0, bounds.z0);
     const [x1, z1] = this.grid.world(bounds.x1, bounds.z1);
     const x = (x0 + x1) / 2, z = (z0 + z1) / 2;
-    if (Math.hypot(x - player.x, z - player.z) > 155) return false;
+    if (Math.hypot(x - player.x, z - player.z) > this.viewDistance) return false;
     this.viewBox.min.set(x0 - 3, -5, z0 - 3);
     this.viewBox.max.set(x1 + 1, 32, z1 + 1);
     return this.viewFrustum.intersectsBox(this.viewBox);
@@ -398,6 +418,7 @@ export class PrefabManager {
     this.prepareFrustum(camera);
     const [gx, gz] = this.grid.grid(player.x, player.z);
     const block = this.grid.blockAt(gx, gz);
+    this.simulationBX=block.bx;this.simulationBZ=block.bz;
     for (const assets of this.blockAssets.values()) {
       assets.distance = Math.max(Math.abs(assets.bx - block.bx), Math.abs(assets.bz - block.bz));
       this.setBlockVisible(assets, this.blockInView(assets.bx, assets.bz, player), assets.distance);
@@ -407,7 +428,8 @@ export class PrefabManager {
   isWorldActive(x: number, z: number): boolean {
     const [gx, gz] = this.grid.grid(x, z);
     const block = this.grid.blockAt(gx, gz);
-    return this.blockAssets.get(`${block.bx}:${block.bz}`)?.active ?? false;
+    const assets=this.blockAssets.get(`${block.bx}:${block.bz}`);
+    return Boolean(assets&&(assets.active||Math.max(Math.abs(block.bx-this.simulationBX),Math.abs(block.bz-this.simulationBZ))<=1));
   }
 
   private *generateBlockAssets(bounds: BlockBounds): Generator<void, BlockBounds> {
@@ -427,8 +449,15 @@ export class PrefabManager {
     const plans = this.accessiblePlans(bounds, this.plansByBlock.get(`${bounds.bx}:${bounds.bz}`) || []);
     for (const plan of plans) {
       const firstRoot = roots.length;
-      capture(() => this.createBuilding(plan));
-      const buildingRoots = roots.slice(firstRoot);
+      const building=this.createBuilding(plan);
+      let done=false;
+      while(!done) {
+        const before=new Set(this.scene.children),result=building.next();done=Boolean(result.done);
+        roots.push(...this.scene.children.filter(object=>!before.has(object)));
+        yield;
+      }
+      const buildingRoots=[...new Set(roots.splice(firstRoot))].filter(object=>object.parent===this.scene);
+      roots.push(...buildingRoots);
       this.registerStaticPieces(buildingRoots);
       yield;
     }
@@ -449,17 +478,22 @@ export class PrefabManager {
     this.snapVoxelDecorations(decorationRoots);
     yield;
     this.registerStaticPieces(decorationRoots);
-    this.resolveStaticVoxelOverlaps(firstVoxel, this.voxels.length, firstPiece);
+    yield* this.resolveStaticVoxelOverlaps(firstVoxel, this.voxels.length, firstPiece);
+    yield;
     this.clipGroundToStaticVoxels(firstPiece);
-    this.aggregateStaticSurfaces(roots);
+    yield;
+    yield* this.aggregateStaticSurfaces(roots);
     this.aggregateVoxelDecorations(decorationRoots);
+    yield;
     this.registerCityLights(roots);
+    yield;
     const props = this.collectBlockProps(roots);
     this.batchStaticSubtrees(props);
+    yield;
     // Interior fixtures and stair parts are static until individually hit.
     // Instance them per building as well, keeping each source voxel recoverable
     // so destruction still converts just that voxel back to a live mesh.
-    for (const interior of this.interiorLodGroups.slice(interiorCount)) this.batchStaticSubtrees(interior);
+    for (const interior of this.interiorLodGroups.slice(interiorCount)) {this.batchStaticSubtrees(interior);yield;}
     this.scene.add(props);
     props.updateMatrixWorld(true);
     props.traverse((object) => { object.matrixAutoUpdate = false; object.matrixWorldAutoUpdate = false; });
@@ -493,6 +527,10 @@ export class PrefabManager {
     return bounds;
   }
 
+  blockReady(bx:number,bz:number):boolean{return this.blockAssets.has(`${bx}:${bz}`);}
+  get generatedBlockCount():number{return this.blockAssets.size;}
+  get pendingWork(): number {return Number(Boolean(this.pendingBlock))+this.meshRequests.size+this.decorationRequests.size+this.dirtyAggregates.size+this.completedShells.length+this.completedDecorations.length+this.groundRequests.size+this.completedGround.length+this.dirtyGround.size;}
+
   streamingStats(): { generatedBlocks: number; renderedBlocks: number; queuedMeshes: number; shellTriangles: number; unmergedShellTriangles: number; groundTriangles: number; unmergedGroundTriangles: number; logicalVoxels: number } {
     let shellTriangles = 0, unmergedShellTriangles = 0, renderedBlocks = 0, groundTriangles = 0, unmergedGroundTriangles = 0;
     for (const block of this.blockAssets.values()) if (block.active) {
@@ -512,6 +550,7 @@ export class PrefabManager {
   }
 
   private updateVisibleBlocks(bx: number, bz: number): void {
+    this.simulationBX=bx;this.simulationBZ=bz;
     for (const assets of this.blockAssets.values()) {
       const distance = Math.max(Math.abs(assets.bx - bx), Math.abs(assets.bz - bz));
       assets.distance = distance;
@@ -624,7 +663,7 @@ export class PrefabManager {
         const dimensions = piece?.dimensions;
         const material = object.material;
         if (piece?.alive && dimensions && !dimensions.signUv && !piece.palette && !object.userData.cityLight &&
-            material instanceof THREE.MeshStandardMaterial && !material.map) pieces.push(piece);
+            material instanceof THREE.MeshStandardMaterial && !material.map && [0,4,8].every(column=>{const e=object.matrixWorld.elements;return [0,1,2].filter(row=>Math.abs(e[column+row])>.001).length===1&&Math.abs(Math.hypot(e[column],e[column+1],e[column+2])-1)<.001;})) pieces.push(piece);
       });
     }
     const groups = new Map<string, InteriorPiece[]>();
@@ -636,26 +675,15 @@ export class PrefabManager {
   }
 
   private createDecorationAggregate(pieces: InteriorPiece[], roots: THREE.Object3D[]): void {
-    if (pieces.length < 2) return;
-    const surface = meshVoxelDecorations(pieces.map((piece) => piece.mesh));
-    if (!surface?.indexes.length) return;
-    const geometry = new THREE.BufferGeometry();
-    const positions = surface.positions;
-    for (let index = 0; index < positions.length; index++) positions[index] *= VOXEL_SIZE;
-    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    geometry.setAttribute('normal', new THREE.BufferAttribute(surface.normals, 3));
-    geometry.setAttribute('color', new THREE.BufferAttribute(surface.colors, 3));
-    geometry.setIndex(new THREE.BufferAttribute(surface.indexes, 1));
-    geometry.userData.decorationPieceForFace = surface.voxelForFace;
-    geometry.userData.surfaceStats = { exposedFaces: surface.exposedFaces, quads: surface.quads };
-    geometry.computeBoundingSphere();
-
+    if (pieces.length < 2 || !this.hasMergeableNeighbors(pieces)) return;
+    const geometry=this.combineSourceGeometry(pieces);
+    if(!geometry)return;
     const mesh = new THREE.Mesh(geometry, voxelDecorationMaterial);
     mesh.castShadow = pieces.some((piece) => piece.mesh.castShadow);
     mesh.receiveShadow = true;
     mesh.userData.aggregateSurface = true;
     mesh.userData.surfaceKind = 'decoration';
-    mesh.userData.surfaceStats = { originalPieces: pieces.length, triangles: surface.quads * 2 };
+    mesh.userData.surfaceStats = { originalPieces: pieces.length, triangles: geometry.index!.count/3 };
     const aggregateRoot = new THREE.Group();
     aggregateRoot.userData.voxelDecorationAggregate = true;
     aggregateRoot.add(mesh);
@@ -665,6 +693,7 @@ export class PrefabManager {
     const state: StaticAggregateState = { mesh, pieces, revision: 0, pending: false,
       workerPieces: pieces.map((piece) => this.decorationPieceStatic(piece)) };
     this.aggregatePiecesByMesh.set(mesh, pieces);
+    this.dirtyAggregates.add(state);
     for (const piece of pieces) {
       piece.aggregate = state;
       piece.mesh.visible = false;
@@ -757,6 +786,14 @@ export class PrefabManager {
         };
         this.interiorPieces.push(piece);
         this.interiorPieceByMesh.set(object, piece);
+        if (!object.userData.noObstacle && !object.userData.dynamicVehicle) {
+          const [x0,z0] = this.grid.grid(piece.bounds.min.x, piece.bounds.min.z);
+          const [x1,z1] = this.grid.grid(piece.bounds.max.x, piece.bounds.max.z);
+          for (let z=z0;z<=z1;z++) for (let x=x0;x<=x1;x++) {
+            const key=this.grid.index(x,z), items=this.collisionPiecesByCell.get(key)??[];
+            items.push(piece);this.collisionPiecesByCell.set(key,items);
+          }
+        }
         for(const id of object.userData.walkSurfaceIds??[]) {
           const surface=this.grid.surfaces.surfaces.get(id),pieces=this.walkSurfacePieces.get(id)??[];
           pieces.push(piece);this.walkSurfacePieces.set(id,pieces);
@@ -790,7 +827,7 @@ export class PrefabManager {
   /** Resolve solid occupancy once for every generated block. A fine lattice
    * also represents the larger shell voxels, so prefab boundaries cannot
    * leave two destructible voxels in the same volume. */
-  private resolveStaticVoxelOverlaps(firstVoxel: number, lastVoxel: number, firstPiece: number): void {
+  private *resolveStaticVoxelOverlaps(firstVoxel: number, lastVoxel: number, firstPiece: number): Generator<void> {
     const occupied = new Set<string>();
     const keysAt = (point: THREE.Vector3, size: number): string[] => {
       const ratio = Math.round(size / VOXEL_SIZE);
@@ -818,6 +855,7 @@ export class PrefabManager {
         }
       }
       voxel.alive = this.hasPieces(voxel);
+      yield;
     }
     const point = new THREE.Vector3();
     const incoming = this.interiorPieces.slice(firstPiece);
@@ -862,6 +900,7 @@ export class PrefabManager {
         this.overlapRemovals.static++;
         changed = true;
       }
+      yield;
       if (!changed) continue;
       piece.mesh.userData.voxelMask = piece.mask;
       piece.alive = piece.mask.some(Boolean);
@@ -934,7 +973,7 @@ export class PrefabManager {
             if(ix<0||iz<0||ix>=layer.width||iz>=layer.depth)continue;
             layer.heights[ix+iz*layer.width]=this.grid.pavementOffset(vx*size,vz*size)-CITY_VOXEL_SIZE;
           }
-        this.dirtyGround.add(ground);
+        this.markGroundDirty(ground);
         const bounds=ground.userData.groundBounds as {x0:number;z0:number;width:number;depth:number;size:number};
         const ix=Math.floor((cx-bounds.x0)/bounds.size),iz=Math.floor((cz-bounds.z0)/bounds.size);
         if(ix>=0&&iz>=0&&ix<bounds.width&&iz<bounds.depth) {
@@ -968,7 +1007,7 @@ export class PrefabManager {
         const list=ground.userData.coverPieces as InteriorPiece[] ?? [];
         list.push(piece);ground.userData.coverPieces=list;
         const base=this.grid.terrain.height(piece.center.x,piece.center.z);
-        if(piece.bounds.min.y<=base+.08&&piece.bounds.max.y>=base-.001)this.dirtyGround.add(ground);
+        if(piece.bounds.min.y<=base+.08&&piece.bounds.max.y>=base-.001)this.markGroundDirty(ground);
       }
     }
   }
@@ -997,75 +1036,62 @@ export class PrefabManager {
     bank.geometry.dispose();bank.geometry=geometry;bank.visible=this.groundVisible&&surface.indexes.length>0;
   }
 
+  private markGroundDirty(ground:THREE.Mesh):void {
+    ground.userData.groundRevision=(ground.userData.groundRevision??0)+1;this.dirtyGround.add(ground);
+  }
   flushGroundDamage(): void {
-    const deadline=performance.now()+3;
-    for (const ground of this.dirtyGround) {
-      const layer = ground.userData.groundLayer as GroundLayer;
-      layer.hidden.fill(0);
-      for(const piece of ground.userData.coverPieces as InteriorPiece[] ?? []) {
-        if(!piece.alive)continue;
-        const x0=Math.max(0,Math.floor((piece.bounds.min.x-layer.x0)/layer.size));
-        const x1=Math.min(layer.width-1,Math.floor((piece.bounds.max.x-layer.x0)/layer.size));
-        const z0=Math.max(0,Math.floor((piece.bounds.min.z-layer.z0)/layer.size));
-        const z1=Math.min(layer.depth-1,Math.floor((piece.bounds.max.z-layer.z0)/layer.size));
-        for(let z=z0;z<=z1;z++)for(let x=x0;x<=x1;x++) {
-          const wx=layer.x0+(x+.5)*layer.size,wz=layer.z0+(z+.5)*layer.size;
-          const y=this.grid.terrain.height(wx,wz)+layer.heights[x+z*layer.width];
-          if(y<piece.bounds.min.y-.001||y>piece.bounds.max.y+.001)continue;
-          if(this.pieceOccupies(piece,wx,y-.001,wz)||this.pieceOccupies(piece,wx,y+.001,wz))layer.hidden[x+z*layer.width]=1;
+    const result=this.completedGround.shift();
+    if(result) {
+      const request=this.groundRequests.get(result.id);this.groundRequests.delete(result.id);
+      if(request) {
+        const {ground,revision}=request;
+        if(revision!==ground.userData.groundRevision)this.markGroundDirty(ground);
+        else {
+          const geometry=new THREE.BufferGeometry();
+          geometry.setAttribute('position',new THREE.BufferAttribute(result.positions,3));
+          geometry.setAttribute('uv',new THREE.BufferAttribute(result.uvs,2));geometry.setIndex(new THREE.BufferAttribute(result.indexes,1));
+          geometry.computeVertexNormals();geometry.computeBoundingSphere();
+          const layer=ground.userData.groundLayer as GroundLayer;
+          geometry.userData.surfaceStats={cells:layer.width*layer.depth/(VOXELS_PER_CELL*VOXELS_PER_CELL),quads:result.indexes.length/6};
+          ground.geometry.dispose();ground.geometry=geometry;
+          let bank=ground.userData.terrainBank as THREE.Mesh|undefined;
+          if(bank||result.bankIndexes.length) {
+            if(!bank) {bank=new THREE.Mesh(new THREE.BufferGeometry(),voxelDecorationMaterial);bank.name='voxel-terrain-cutout-bank';bank.userData.terrainFoundation=true;bank.receiveShadow=true;ground.userData.terrainBank=bank;(ground.parent??this.scene).add(bank);}
+            const bankGeometry=new THREE.BufferGeometry(),paint=new THREE.Color('#998b6c'),colors=new Float32Array(result.bankPositions.length);
+            for(let i=0;i<colors.length;i+=3){colors[i]=paint.r;colors[i+1]=paint.g;colors[i+2]=paint.b;}
+            bankGeometry.setAttribute('position',new THREE.BufferAttribute(result.bankPositions,3));bankGeometry.setAttribute('color',new THREE.BufferAttribute(colors,3));
+            bankGeometry.setIndex(new THREE.BufferAttribute(result.bankIndexes,1));bankGeometry.computeVertexNormals();bankGeometry.computeBoundingSphere();
+            bank.geometry.dispose();bank.geometry=bankGeometry;bank.visible=this.groundVisible&&result.bankIndexes.length>0;
+          }
         }
       }
-      const heights = layer.heights.slice();
-      for (let i = 0; i < heights.length; i++) if (layer.hidden[i]) heights[i] = NaN;
-      const result = meshTerrainSurface(layer.width, layer.depth, heights, layer.size, layer.x0, layer.z0,
-        (x,z) => this.grid.terrain.height(x,z), () => false, layer.cutouts);
-      const positions = Array.from(result.positions), uvs = Array.from(result.uvs), indexes = Array.from(result.indexes);
-      type Riser={a:number[];b:number[];lowA:number;lowB:number;highA:number;highB:number;dx:number;dz:number};
-      const risers=new Map<string,Riser>();
-      const emitRiser=(r:Riser)=>{
-        const first=positions.length/3;
-        positions.push(r.a[0],r.lowA,r.a[1],r.b[0],r.lowB,r.b[1],r.b[0],r.highB,r.b[1],r.a[0],r.highA,r.a[1]);
-        for(const point of [r.a,r.b,r.b,r.a])uvs.push(
-          (point[0]-r.dx*layer.size/2-layer.x0)/(layer.width*layer.size),
-          (point[1]-r.dz*layer.size/2-layer.z0)/(layer.depth*layer.size));
-        if(r.dx===1||r.dz===-1)indexes.push(first,first+1,first+2,first,first+2,first+3);
-        else indexes.push(first,first+2,first+1,first,first+3,first+2);
-      };
-      // The same height field owns crater walls and sidewalk edges. No
-      // separate curb mesh can survive after the paving below it is removed.
-      for (let z = 0; z < layer.depth; z++) for (let x = 0; x < layer.width; x++) {
-        const height = heights[x + z * layer.width];
-        if (!Number.isFinite(height)) continue;
-        const x0 = layer.x0 + x * layer.size, z0 = layer.z0 + z * layer.size;
-        for (const [dx,dz] of [[-1,0],[1,0],[0,-1],[0,1]]) {
-          const nx = x+dx, nz = z+dz;
-          const wx=layer.x0+(nx+.5)*layer.size,wz=layer.z0+(nz+.5)*layer.size;
-          if(layer.cutouts.some(c=>wx>c.x0&&wx<c.x1&&wz>c.z0&&wz<c.z1))continue;
-          const top = nx < 0 || nz < 0 || nx >= layer.width || nz >= layer.depth
-            ?this.grid.pavementHeight(wx,wz)-this.grid.terrain.height(wx,wz):heights[nx+nz*layer.width];
-          if (!Number.isFinite(top) || top <= height) continue;
-          const a = dx ? [x0+(dx>0?layer.size:0), z0] : [x0,z0+(dz>0?layer.size:0)];
-          const b = dx ? [a[0],z0+layer.size] : [x0+layer.size,a[1]];
-          const ea=this.grid.terrain.height(a[0],a[1]),eb=this.grid.terrain.height(b[0],b[1]);
-          const riser:Riser={a,b,lowA:ea+height,lowB:eb+height,highA:ea+top,highB:eb+top,dx,dz};
-          if(Math.abs(ea-eb)>1e-5){emitRiser(riser);continue;}
-          const key=`${dx}:${dz}:${(dx?a[0]:a[1]).toFixed(5)}:${riser.lowA.toFixed(5)}:${riser.highA.toFixed(5)}`;
-          const previous=risers.get(key);
-          if(previous&&Math.hypot(previous.b[0]-a[0],previous.b[1]-a[1])<1e-5)previous.b=b;
-          else {if(previous)emitRiser(previous);risers.set(key,riser);}
-        }
-      }
-      for(const riser of risers.values())emitRiser(riser);
-      const geometry = new THREE.BufferGeometry();
-      geometry.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));
-      geometry.setAttribute('uv',new THREE.Float32BufferAttribute(uvs,2));
-      geometry.setIndex(indexes);geometry.computeVertexNormals();geometry.computeBoundingSphere();
-      geometry.userData.surfaceStats={cells:layer.width*layer.depth/(VOXELS_PER_CELL*VOXELS_PER_CELL),quads:indexes.length/6};
-      ground.geometry.dispose();ground.geometry=geometry;
-      this.updateTerrainBanks(ground);
-      this.dirtyGround.delete(ground);
-      if(performance.now()>=deadline)break;
     }
+    if(this.groundRequests.size)return;
+    const ground=this.dirtyGround.values().next().value as THREE.Mesh|undefined;if(!ground)return;
+    this.dirtyGround.delete(ground);
+    const layer=ground.userData.groundLayer as GroundLayer,id=this.nextGroundRequest++,revision=ground.userData.groundRevision??0;
+    const covers:GroundCover[]=[],transfers:Transferable[]=[];
+    for(const piece of ground.userData.coverPieces as InteriorPiece[]??[]) {
+      if(!piece.alive||piece.bounds.min.y>.08||piece.bounds.max.y<-.5)continue;
+      const mask=piece.mask.slice();transfers.push(mask.buffer);
+      covers.push({bounds:[...piece.bounds.min.toArray(),...piece.bounds.max.toArray()],inverse:(piece.inverseWorld??piece.mesh.matrixWorld.clone().invert()).toArray(),
+        ...piece.dimensions,size:piece.dimensions.voxelSize??VOXEL_SIZE,mask});
+    }
+    const heights=layer.heights.slice();transfers.push(heights.buffer);
+    const border={north:new Float32Array(layer.width),south:new Float32Array(layer.width),west:new Float32Array(layer.depth),east:new Float32Array(layer.depth)};
+    for(let x=0;x<layer.width;x++)for(const side of ['north','south'] as const) {
+      const wx=layer.x0+(x+.5)*layer.size,wz=layer.z0+(side==='north'?-.5:layer.depth+.5)*layer.size;
+      border[side][x]=this.grid.pavementHeight(wx,wz)-this.grid.terrain.height(wx,wz);
+    }
+    for(let z=0;z<layer.depth;z++)for(const side of ['west','east'] as const) {
+      const wx=layer.x0+(side==='west'?-.5:layer.width+.5)*layer.size,wz=layer.z0+(z+.5)*layer.size;
+      border[side][z]=this.grid.pavementHeight(wx,wz)-this.grid.terrain.height(wx,wz);
+    }
+    this.groundRequests.set(id,{ground,revision});
+    const message:GroundRequest={kind:'ground',id,revision,layer:{size:layer.size,heights,width:layer.width,depth:layer.depth,x0:layer.x0,z0:layer.z0,
+        cutouts:layer.cutouts.map(c=>({x0:c.x0,x1:c.x1,z0:c.z0,z1:c.z1}))},covers,border,
+      terrain:{roadX:this.grid.roadX,roadZ:this.grid.roadZ,center:this.grid.center,size:this.grid.cellSize}};
+    this.groundWorker.postMessage(message,transfers);
   }
 
   private paintGroundMark(ground: THREE.Mesh, mark: GroundMark): void {
@@ -1113,7 +1139,7 @@ export class PrefabManager {
   }
 
   /** Greedy-mesh every compatible static voxel piece by material and storey, regardless of prefab role. */
-  private aggregateStaticSurfaces(roots: THREE.Object3D[]): void {
+  private *aggregateStaticSurfaces(roots: THREE.Object3D[]): Generator<void> {
     const interiorGroups = new Set(this.interiorLodGroups);
     for (const root of roots) {
       if (!(root instanceof THREE.Group) || !root.userData.waitingForShell) continue;
@@ -1157,59 +1183,62 @@ export class PrefabManager {
         group.pieces.push(piece);
       });
       for (const { pieces, container } of groups.values()) {
-        if (pieces.length < 2) continue;
-        const cells: number[] = [];
-        const voxelSize = pieces[0].dimensions.voxelSize ?? VOXEL_SIZE;
-        const latticeOffset: [number, number, number] = (() => {
-          const piece = pieces[0], { nx, ny, nz } = piece.dimensions, e = piece.mesh.matrixWorld.elements;
-          const local = [-(nx - 1) * voxelSize / 2, -(ny - 1) * voxelSize / 2, -(nz - 1) * voxelSize / 2];
-          return [0, 1, 2].map((axis) => {
-            const world = e[12 + axis] + e[axis] * local[0] + e[4 + axis] * local[1] + e[8 + axis] * local[2];
-            return Math.abs(world / voxelSize - Math.round(world / voxelSize)) < 0.001 ? 0 : 0.5;
-          }) as [number, number, number];
-        })();
-        for (const piece of pieces) {
-          const { nx, ny, nz } = piece.dimensions;
-          const e = piece.mesh.matrixWorld.elements;
-          for (let y = 0; y < ny; y++) for (let z = 0; z < nz; z++) for (let x = 0; x < nx; x++) {
-            if (!piece.mask[x + nx * (z + nz * y)]) continue;
-            const lx = (x - (nx - 1) / 2) * voxelSize;
-            const ly = (y - (ny - 1) / 2) * voxelSize;
-            const lz = (z - (nz - 1) / 2) * voxelSize;
-            const worldX = e[0] * lx + e[4] * ly + e[8] * lz + e[12];
-            const worldY = e[1] * lx + e[5] * ly + e[9] * lz + e[13];
-            const worldZ = e[2] * lx + e[6] * ly + e[10] * lz + e[14];
-            cells.push(Math.round(worldX / voxelSize - latticeOffset[0]), Math.round(worldY / voxelSize - latticeOffset[1]),
-              Math.round(worldZ / voxelSize - latticeOffset[2]), 1, 1, 1);
-          }
-        }
-      const surface = meshVoxelCells(Float32Array.from(cells), new Uint32Array(cells.length / 6), true);
-      const originalTriangles = pieces.reduce((sum, piece) => sum + (piece.mesh.geometry.index?.count ?? piece.mesh.geometry.getAttribute('position').count) / 3, 0);
-      if (surface.quads * 2 >= originalTriangles * 0.9) continue;
-      for (let i = 0; i < surface.positions.length; i++) {
-        const axis = i % 3;
-        surface.positions[i] = (surface.positions[i] + latticeOffset[axis] - 0.5) * voxelSize;
-      }
-        const geometry = new THREE.BufferGeometry();
-        geometry.setAttribute('position', new THREE.BufferAttribute(surface.positions, 3));
-        geometry.setAttribute('normal', new THREE.BufferAttribute(surface.normals, 3));
-        geometry.setAttribute('color', new THREE.BufferAttribute(surface.colors, 3));
-        geometry.setIndex(new THREE.BufferAttribute(surface.indexes, 1));
-        geometry.computeBoundingSphere();
-        const first = pieces[0].mesh;
-        const aggregate = new THREE.Mesh(geometry, first.material);
+        if (pieces.length < 2 || !this.hasMergeableNeighbors(pieces)) continue;
+        const geometry=this.combineSourceGeometry(pieces);
+        if(!geometry)continue;
+        const originalTriangles=geometry.index!.count/3;
+        const aggregate = new THREE.Mesh(geometry, voxelDecorationMaterial);
         aggregate.castShadow = pieces.some((piece) => piece.mesh.castShadow);
         aggregate.receiveShadow = true;
         aggregate.userData.aggregateSurface = true;
         aggregate.userData.surfaceKind = pieces.every((piece) => piece.mesh.userData.floorLevel !== undefined) ? 'floor' : 'detail';
-        aggregate.userData.surfaceStats = { originalTriangles, triangles: surface.quads * 2 };
+        aggregate.userData.surfaceStats = { originalTriangles, triangles: originalTriangles };
         container.add(aggregate);
         aggregate.position.y = -container.getWorldPosition(new THREE.Vector3()).y;
         this.aggregatePiecesByMesh.set(aggregate, pieces);
-        const state: StaticAggregateState = { mesh: aggregate, pieces, revision: 0, pending: false };
+        const state: StaticAggregateState = { mesh: aggregate, pieces, revision: 0, pending: false, gridSize:pieces[0].dimensions.voxelSize??VOXEL_SIZE };
+        state.latticeOffset=pieces[0].bounds.min.toArray().map(value=>{const scaled=value/state.gridSize!;return scaled-Math.floor(scaled+1e-5);});
+        this.dirtyAggregates.add(state);
         for (const piece of pieces) { piece.aggregate = state; piece.mesh.visible = false; }
+        yield;
       }
     }
+  }
+
+  /** Disconnected cuboids already have minimal faces; instance them instead of
+   * creating one remesh job and one draw for every material/storey group. */
+  private hasMergeableNeighbors(pieces:readonly InteriorPiece[]):boolean {
+    const sorted=[...pieces].sort((a,b)=>a.bounds.min.x-b.bounds.min.x),epsilon=.001;
+    for(let i=0;i<sorted.length;i++)for(let j=i+1;j<sorted.length;j++) {
+      const a=sorted[i].bounds,b=sorted[j].bounds;
+      if(b.min.x>a.max.x+epsilon)break;
+      const x=Math.min(a.max.x,b.max.x)-Math.max(a.min.x,b.min.x);
+      const y=Math.min(a.max.y,b.max.y)-Math.max(a.min.y,b.min.y);
+      const z=Math.min(a.max.z,b.max.z)-Math.max(a.min.z,b.min.z);
+      if(x>=-epsilon&&y>=-epsilon&&z>=-epsilon&&Number(x>epsilon)+Number(y>epsilon)+Number(z>epsilon)>=2)return true;
+    }
+    return false;
+  }
+
+  private combineSourceGeometry(pieces: InteriorPiece[]): THREE.BufferGeometry | null {
+    const geometries: THREE.BufferGeometry[]=[];
+    for(const piece of pieces) {
+      const geometry=piece.mesh.geometry.clone().applyMatrix4(piece.mesh.matrixWorld);
+      // Source fixtures can carry UVs; the merged voxel material only consumes these attributes.
+      for(const attribute of Object.keys(geometry.attributes))if(!['position','normal','color'].includes(attribute))geometry.deleteAttribute(attribute);
+      const paint=piece.mesh.material as THREE.MeshStandardMaterial;
+      const colors=geometry.getAttribute('color'),count=geometry.getAttribute('position').count;
+      const values=new Float32Array(count*3);
+      for(let i=0;i<count;i++) {
+        values[i*3]=(colors?.getX(i)??1)*paint.color.r;
+        values[i*3+1]=(colors?.getY(i)??1)*paint.color.g;
+        values[i*3+2]=(colors?.getZ(i)??1)*paint.color.b;
+      }
+      geometry.setAttribute('color',new THREE.BufferAttribute(values,3));geometries.push(geometry);
+    }
+    const merged=mergeGeometries(geometries,false);
+    geometries.forEach(geometry=>geometry.dispose());
+    merged?.computeBoundingSphere();return merged;
   }
 
   private queueShellRegion(assets: BlockAssets, region: ShellRegion): void {
@@ -1282,7 +1311,7 @@ export class PrefabManager {
     this.meshRequests.delete(data.id);
     const { assets, region, revision } = request;
     region.pendingRevision = null;
-    if (revision !== region.revision || !assets.active) return;
+    if (revision !== region.revision || !assets.active) {region.dirty=true;return;}
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.BufferAttribute(data.positions, 3));
     geometry.setAttribute('normal', new THREE.BufferAttribute(data.normals, 3));
@@ -1317,6 +1346,7 @@ export class PrefabManager {
   }
 
   flushFarMeshes(): void {
+    const completed=this.completedShells.shift();if(completed)this.receiveFarMesh(completed);
     const pending = [...this.blockAssets.values()].filter((assets) => assets.active);
     pending.sort((a, b) => a.distance - b.distance);
     for (const assets of pending) {
@@ -1328,16 +1358,12 @@ export class PrefabManager {
   }
 
   flushStaticDamage(): void {
+    const completed=this.completedDecorations.shift();if(completed)this.receiveDecorationMesh(completed);
     for (const state of this.dirtyAggregates) {
       this.dirtyAggregates.delete(state);
       if (state.pending) continue;
-      // Avoid paying structured-clone and transfer setup for small surfaces.
-      // Large aggregates are the ones that can cause visible main-thread stalls.
-      if (state.pieces.length <= 80) {
-        const surface = meshVoxelDecorations(state.pieces.map((piece) => piece.mesh));
-        this.applyDecorationMesh(state, surface ?? { positions: new Float32Array(), normals: new Float32Array(),
-          colors: new Float32Array(), indexes: new Uint32Array(), voxelForFace: new Uint32Array(), exposedFaces: 0, quads: 0 });
-      } else this.queueDecorationMesh(state);
+      if(this.decorationRequests.size>=2){this.dirtyAggregates.add(state);break;}
+      this.queueDecorationMesh(state);
       break;
     }
     this.flushGroundDamage();
@@ -1347,7 +1373,7 @@ export class PrefabManager {
     const id = this.nextDecorationRequest++;
     const revision = state.revision;
     const transfers: Transferable[] = [];
-    const staticPieces = state.workerPieces ?? (state.workerPieces = state.pieces.map((piece) => this.decorationPieceStatic(piece)));
+    const staticPieces = state.workerPieces ?? (state.workerPieces = state.pieces.map((piece) => this.decorationPieceStatic(piece,state.mesh.userData.surfaceKind==='decoration')));
     const pieces = state.pieces.map((piece, index) => {
       const mask = piece.mask.slice();
       transfers.push(mask.buffer);
@@ -1355,14 +1381,14 @@ export class PrefabManager {
     });
     this.decorationRequests.set(id, { state, revision });
     state.pending = true;
-    this.decorationWorker.postMessage({ id, revision, gridSize: VOXEL_SIZE, pieces }, transfers);
+    this.decorationWorker.postMessage({ id, revision, gridSize: state.gridSize??VOXEL_SIZE, latticeOffset:state.latticeOffset,pieces }, transfers);
   }
 
-  private decorationPieceStatic(piece: InteriorPiece): DecorationPieceStatic {
+  private decorationPieceStatic(piece: InteriorPiece,vertexTint=true): DecorationPieceStatic {
     const paint = piece.mesh.material as THREE.MeshStandardMaterial;
     const vertexColor = piece.mesh.geometry.getAttribute('color');
     const tint = paint.color.clone();
-    if (vertexColor && vertexColor.count) tint.multiply(new THREE.Color().setRGB(vertexColor.getX(0), vertexColor.getY(0), vertexColor.getZ(0)));
+    if (vertexTint && vertexColor && vertexColor.count) tint.multiply(new THREE.Color().setRGB(vertexColor.getX(0), vertexColor.getY(0), vertexColor.getZ(0)));
     return { nx: piece.dimensions.nx, ny: piece.dimensions.ny, nz: piece.dimensions.nz,
       voxelSize: piece.dimensions.voxelSize ?? VOXEL_SIZE, tint: [tint.r, tint.g, tint.b],
       matrixWorld: new Float32Array(piece.mesh.matrixWorld.elements) };
@@ -1378,13 +1404,17 @@ export class PrefabManager {
       this.dirtyAggregates.add(state);
       return;
     }
+    const stats=state.mesh.userData.surfaceStats;
+    if(revision===0&&stats?.originalTriangles&&result.indexes.length/3>=stats.originalTriangles*.9) {
+      state.mesh.userData.surfaceKind='batched';return;
+    }
     this.applyDecorationMesh(state, result);
   }
 
   private applyDecorationMesh(state: StaticAggregateState,
     result: Pick<DecorationMeshResult, 'positions' | 'normals' | 'colors' | 'indexes' | 'voxelForFace'>): void {
     const geometry = new THREE.BufferGeometry();
-    for (let i = 0; i < result.positions.length; i++) result.positions[i] *= VOXEL_SIZE;
+    for (let i = 0; i < result.positions.length; i++) result.positions[i]=(result.positions[i]+(state.latticeOffset?.[i%3]??0))*(state.gridSize??VOXEL_SIZE);
     geometry.setAttribute('position', new THREE.BufferAttribute(result.positions, 3));
     geometry.setAttribute('normal', new THREE.BufferAttribute(result.normals, 3));
     geometry.setAttribute('color', new THREE.BufferAttribute(result.colors, 3));
@@ -1397,6 +1427,7 @@ export class PrefabManager {
     state.mesh.geometry = geometry;
     state.mesh.material = voxelDecorationMaterial;
     state.mesh.visible = Boolean(result.indexes.length);
+    state.mesh.userData.surfaceStats={...state.mesh.userData.surfaceStats,triangles:result.indexes.length/3};
   }
 
   private roadMarkings(bounds: BlockBounds): Array<{ x: number; z: number; w: number; d: number; paint: string }> {
@@ -1507,7 +1538,7 @@ export class PrefabManager {
     for (const mark of this.groundMarks) this.paintGroundMark(ground, mark);
     this.groundTiles.push(ground); this.scene.add(ground);
     this.updateTerrainBanks(ground);
-    this.dirtyGround.add(ground);
+    this.markGroundDirty(ground);
   }
 
   /** Reserve entrances before any street or courtyard props are placed. */
@@ -1528,13 +1559,18 @@ export class PrefabManager {
     return !!cell && !this.entranceApproaches.has(this.grid.index(cell.x, cell.z));
   }
 
-  private createBuilding(plan: BuildingPlan): void {
+  private *createBuilding(plan: BuildingPlan): Generator<void> {
     const prefab = buildingPrefab(plan.type);
     if (plan.width < prefab.minimumFootprintCells || plan.depth < prefab.minimumFootprintCells) plan = { ...plan, height: 2 };
     const firstVoxel = this.voxels.length;
     const firstStation = this.interiorStations.length, firstStair = this.staircases.length;
     const baseY = this.grid.terrain.plateau(this.grid.blockAt(plan.x,plan.z).bx,this.grid.blockAt(plan.x,plan.z).bz);
-    const firstSceneChild = this.scene.children.length;
+    const createdRoots=new Set<THREE.Object3D>();
+    let beforeChildren=new Set(this.scene.children);
+    const captureNew=()=>{for(const object of this.scene.children)if(!beforeChildren.has(object))createdRoots.add(object);};
+    const checkpoint=function* (scene:THREE.Scene):Generator<void> {
+      captureNew();yield;beforeChildren=new Set(scene.children);
+    };
     const district = districtForType(plan.type);
     const main = this.facadePaint(district, plan.x, plan.z);
     const doorX = plan.x + Math.floor(plan.width / 2);
@@ -1610,8 +1646,10 @@ export class PrefabManager {
           }
         }
       }
+      yield* checkpoint(this.scene);
     }
     this.addRoofDetail(plan);
+    yield* checkpoint(this.scene);
     this.interiorAreas.push(interior);
     const interiorStart = this.scene.children.length;
     const occupied = this.addInterior(plan);
@@ -1620,6 +1658,7 @@ export class PrefabManager {
     for (const object of this.scene.children.slice(interiorStart)) interiorDetails.add(object);
     this.scene.add(interiorDetails);
     this.interiorLodGroups.push(interiorDetails);
+    yield* checkpoint(this.scene);
     this.addFacadeDetails(plan);
     const approach = this.grid.cell(doorX, frontZ + frontageDirection(plan)) || this.grid.cell(doorX, frontZ);
     if (approach && !approach.blocked) this.pedestrianAnchors.push({ cell: approach, type: plan.type, district });
@@ -1628,7 +1667,8 @@ export class PrefabManager {
       if (bayApproach && !bayApproach.blocked) this.pedestrianAnchors.push({ cell: bayApproach, type: plan.type, district });
     }
     const decorations = new THREE.Group();
-    for (const object of this.scene.children.slice(firstSceneChild)) decorations.add(object);
+    captureNew();
+    for (const object of createdRoots) if(object.parent===this.scene)decorations.add(object);
     decorations.position.y = baseY;
     for(let i=firstVoxel;i<this.voxels.length;i++){this.voxels[i].y+=baseY;this.voxels[i].baseY=baseY;}
     for(let i=firstStation;i<this.interiorStations.length;i++)this.interiorStations[i].position.y+=baseY;
@@ -1813,16 +1853,10 @@ export class PrefabManager {
     piece.mesh.userData.voxelMask = piece.mask;
     for(const ground of this.groundMeshesNear(piece.center.x,piece.center.z,
       Math.max(piece.bounds.max.x-piece.bounds.min.x,piece.bounds.max.z-piece.bounds.min.z)/2)) {
-      if((ground.userData.coverPieces as InteriorPiece[] | undefined)?.includes(piece))this.dirtyGround.add(ground);
+      if((ground.userData.coverPieces as InteriorPiece[] | undefined)?.includes(piece))this.markGroundDirty(ground);
     }
-    if (piece.aggregate) return;
-    if (piece.ownsGeometry) piece.mesh.geometry.dispose();
-    if (piece.alive) {
-      const { nx, ny, nz, signUv } = piece.dimensions;
-      piece.mesh.geometry = voxelSurfaceGeometry(nx, ny, nz, piece.mask, signUv, piece.palette, voxelSize, piece.dimensions.suppressBottomBoundary);
-      piece.ownsGeometry = true;
-    } else {
-      piece.mesh.visible = false;
+    if(!piece.alive) {
+      piece.mesh.visible=false;
       const cell = this.grid.cellAtWorld(piece.center.x, piece.center.z);
       if (cell?.blocked) {
         const index = this.grid.index(cell.x, cell.z);
@@ -1832,6 +1866,13 @@ export class PrefabManager {
           : !occupants.some((other) => other.alive);
         if (clear) { cell.blocked = false; this.navigationChanges.add(index); }
       }
+    }
+    if (piece.aggregate) return;
+    if (piece.ownsGeometry) piece.mesh.geometry.dispose();
+    if (piece.alive) {
+      const { nx, ny, nz, signUv } = piece.dimensions;
+      piece.mesh.geometry = voxelSurfaceGeometry(nx, ny, nz, piece.mask, signUv, piece.palette, voxelSize, piece.dimensions.suppressBottomBoundary);
+      piece.ownsGeometry = true;
     }
   }
 
@@ -1864,6 +1905,7 @@ export class PrefabManager {
   interiorMeshesNear(x: number, z: number, radius: number): THREE.Mesh[] {
     const meshes = new Set<THREE.Mesh>();
     for (const piece of this.interiorPiecesNear(x, z, radius)) {
+      if (piece.aggregate) {meshes.add(piece.aggregate.mesh);continue;}
       if (piece.batch) { meshes.add(piece.batch.mesh); continue; }
       if (piece.mesh.visible && piece.mesh.parent?.visible !== false && piece.mesh.parent?.parent?.visible !== false &&
         piece.mesh.parent?.parent?.parent?.visible !== false) meshes.add(piece.mesh);
@@ -1873,6 +1915,78 @@ export class PrefabManager {
 
   stationIntact(station: InteriorStation): boolean {
     return station.group.children.some((child) => this.interiorPieceByMesh.get(child)?.alive === true);
+  }
+
+  /** Occupancy is read from live masks, never visibility or delayed render meshes. */
+  collisionBoxes(bounds: THREE.Box3, add: AddCollisionBox, includeVehicles = true, ignoredVehicle?: THREE.Group | null): void {
+    const [x0,z0]=this.grid.grid(bounds.min.x,bounds.min.z),[x1,z1]=this.grid.grid(bounds.max.x,bounds.max.z);
+    const checkedBlocks=this.collisionBlocks;checkedBlocks.clear();
+    for(let z=z0;z<=z1;z++)for(let x=x0;x<=x1;x++) {
+      const block=this.grid.blockAt(x,z),key=`${block.bx}:${block.bz}`;
+      if(checkedBlocks.has(key))continue;checkedBlocks.add(key);
+      if(this.blockAssets.has(key))continue;
+      const b=this.grid.blockBounds(block.bx,block.bz),[ax,az]=this.grid.world(b.x0,b.z0),[bx,bz]=this.grid.world(b.x1,b.z1),half=this.grid.cellSize/2;
+      add(ax-half,-128,az-half,bx-half,512,bz-half);
+    }
+    for(let z=z0-1;z<=z1+1;z++)for(let x=x0-1;x<=x1+1;x++) {
+      for(const index of this.voxelsByCell.get(this.grid.index(x,z))??[]) {
+        const voxel=this.voxels[index],half=voxel.voxelSize/2;
+        if(!voxel.alive || voxel.x+this.grid.cellSize/2<bounds.min.x || voxel.x-this.grid.cellSize/2>bounds.max.x ||
+          voxel.z+this.grid.cellSize/2<bounds.min.z || voxel.z-this.grid.cellSize/2>bounds.max.z)continue;
+        let columns=this.collisionColumns.get(voxel.positions);
+        if(!columns) {
+          columns=new Map();
+          for(let sub=0;sub<voxel.pieces.length;sub++) {
+            const ix=Math.floor((voxel.positions[sub*3]+this.grid.cellSize/2)/voxel.voxelSize),iz=Math.floor((voxel.positions[sub*3+2]+this.grid.cellSize/2)/voxel.voxelSize),key=ix+iz*256;
+            const column=columns.get(key)??[];column.push(sub);columns.set(key,column);
+          }
+          this.collisionColumns.set(voxel.positions,columns);
+        }
+        const ax=Math.floor((bounds.min.x-half-voxel.x+this.grid.cellSize/2)/voxel.voxelSize),bx=Math.floor((bounds.max.x+half-voxel.x+this.grid.cellSize/2)/voxel.voxelSize);
+        const az=Math.floor((bounds.min.z-half-voxel.z+this.grid.cellSize/2)/voxel.voxelSize),bz=Math.floor((bounds.max.z+half-voxel.z+this.grid.cellSize/2)/voxel.voxelSize);
+        for(let iz=az;iz<=bz;iz++)for(let ix=ax;ix<=bx;ix++)for(const sub of columns.get(ix+iz*256)??[]) {
+          if(voxel.pieces[sub]<=0)continue;
+          const offset=sub*3,px=voxel.x+voxel.positions[offset],py=voxel.y+voxel.positions[offset+1],pz=voxel.z+voxel.positions[offset+2];
+          if(px+half<bounds.min.x||px-half>bounds.max.x||py+half<bounds.min.y||py-half>bounds.max.y||pz+half<bounds.min.z||pz-half>bounds.max.z)continue;
+          add(px-half,py-half,pz-half,px+half,py+half,pz+half);
+        }
+      }
+    }
+    this.collisionSeen.clear();
+    for(let z=z0;z<=z1;z++)for(let x=x0;x<=x1;x++)for(const piece of this.collisionPiecesByCell.get(this.grid.index(x,z))??[]) {
+      if(this.collisionSeen.has(piece))continue;
+      this.collisionSeen.add(piece);
+      if(!piece.alive||!piece.bounds.intersectsBox(bounds))continue;
+      const {nx,ny,nz}=piece.dimensions,size=piece.dimensions.voxelSize??VOXEL_SIZE,e=piece.mesh.matrixWorld.elements;
+      const upright=Math.abs(e[1])+Math.abs(e[4])+Math.abs(e[6])+Math.abs(e[9])<.0001 && e[5]>0;
+      if(!piece.ownsState && upright) {
+        const sx=Math.hypot(e[0],e[2]),sz=Math.hypot(e[8],e[10]);
+        add(-nx*size*sx/2,e[13]-ny*size*e[5]/2,-nz*size*sz/2,
+          nx*size*sx/2,e[13]+ny*size*e[5]/2,nz*size*sz/2,Math.atan2(e[8],e[0]),e[12],e[14]);
+        continue;
+      }
+      const local=this.collisionLocalBounds.copy(bounds).applyMatrix4(piece.inverseWorld??piece.mesh.matrixWorld.clone().invert());
+      const ax=Math.max(0,Math.floor(local.min.x/size+nx/2)),bx=Math.min(nx-1,Math.floor(local.max.x/size+nx/2));
+      const ay=Math.max(0,Math.floor(local.min.y/size+ny/2)),by=Math.min(ny-1,Math.floor(local.max.y/size+ny/2));
+      const az=Math.max(0,Math.floor(local.min.z/size+nz/2)),bz=Math.min(nz-1,Math.floor(local.max.z/size+nz/2));
+      for(let iy=ay;iy<=by;iy++)for(let iz=az;iz<=bz;iz++)for(let ix=ax;ix<=bx;ix++) {
+        if(!piece.mask[ix+nx*(iz+nz*iy)])continue;
+        const box=this.collisionVoxelBounds;
+        box.min.set((ix-nx/2)*size,(iy-ny/2)*size,(iz-nz/2)*size);
+        box.max.copy(box.min).addScalar(size);box.applyMatrix4(piece.mesh.matrixWorld);
+        add(box.min.x,box.min.y,box.min.z,box.max.x,box.max.y,box.max.z);
+      }
+    }
+    if(includeVehicles)for(const vehicle of this.vehicles) {
+      if(vehicle===ignoredVehicle||vehicle.userData.destroyed)continue;
+      const specs=vehicle.userData.vehicle as {length:number;width:number;type:string}|undefined;
+      if(!specs)continue;
+      const reach=Math.hypot(specs.length,specs.width)/2;
+      if(vehicle.position.x+reach<bounds.min.x||vehicle.position.x-reach>bounds.max.x||vehicle.position.z+reach<bounds.min.z||vehicle.position.z-reach>bounds.max.z)continue;
+      const height=['truck','bus','van','ambulance'].includes(specs.type)?2.6:specs.type==='scooter'?1.1:1.6;
+      add(-specs.width/2,vehicle.position.y,-specs.length/2,specs.width/2,vehicle.position.y+height,specs.length/2,
+        vehicle.rotation.y,vehicle.position.x,vehicle.position.z);
+    }
   }
 
   interiorObstacleAt(x: number, z: number, feetY: number): boolean {
@@ -1893,7 +2007,7 @@ export class PrefabManager {
       const nearby = this.grid.cell(cell.x + dx, cell.z + dz);
       if (!nearby) continue;
       for (const piece of this.interiorObstaclesByCell.get(this.grid.index(nearby.x, nearby.z)) || []) {
-        if (!piece.alive || piece.mesh.parent?.visible === false) continue;
+        if (!piece.alive) continue;
         const box = piece.bounds;
         if (piece.mesh.userData.walkSurfaceIds && box.max.y <= feetY + .52) continue;
         if (box.max.y < feetY + 0.25 || box.min.y > feetY + 1.55) continue;
@@ -1981,7 +2095,6 @@ export class PrefabManager {
     let best: { height: number; room: InteriorStaircase['room'] } | null = null;
     let bestDistance = Infinity;
     for (const stairs of this.staircases) {
-      if (stairs.group.parent?.visible === false || stairs.group.parent?.parent?.visible === false) continue;
       if (z < stairs.endZ - 0.12 || z > stairs.startZ + 0.12) continue;
       for (let level = 0; level < stairs.maxLevel; level++) {
         const laneX = stairs.centerX + (level % 2 ? stairs.laneOffset : -stairs.laneOffset);

@@ -1,8 +1,8 @@
 import * as THREE from 'three';
 import type { UrbanTerrain } from './UrbanTerrain';
 
-export const CANAL_SURFACE_Y = -3.96;
-export const CANAL_BED_Y = -4.4;
+import { CANAL_SURFACE_Y, CANAL_BED_Y } from './CanalConstants';
+export { CANAL_SURFACE_Y, CANAL_BED_Y } from './CanalConstants';
 
 /** One current field drives movement, floating fragments and visible ripples. */
 export class CanalWater {

@@ -7,8 +7,9 @@ import type { BodyPart } from './HumanoidModel';
 import { createFaceDecal, setFaceExpression, type FaceExpression } from './FaceTextures';
 import { sampleJointMotion, type JointMotion } from './JointAnimation';
 import type { ContactShadowSystem } from '../engine/ContactShadowSystem';
+import type { CollisionWorld } from '../engine/CollisionWorld';
 
-type Joint = { position: THREE.Vector3; previous: THREE.Vector3 };
+type Joint = { position: THREE.Vector3; previous: THREE.Vector3; inverseMass: number };
 type Link = { a: number; b: number; length: number; mesh: THREE.Mesh; part: BodyPart; baseMaterial: THREE.Material };
 type Constraint = { a: number; b: number; length: number; part: BodyPart; minimum?: boolean };
 type LoosePart = { object: THREE.Group; previous: THREE.Vector3; velocity: THREE.Vector3; floorLevel: number; radius: number; age: number };
@@ -32,6 +33,9 @@ const CROUCHING: Array<[number, number, number]> = [
 ];
 
 export type RagdollBody = {
+  sleeping?: boolean;
+  quietTime?: number;
+  previousStep: number;
   joints: Joint[];
   links: Link[];
   constraints: Constraint[];
@@ -67,6 +71,9 @@ export class RagdollSystem {
   private readonly waterCurrent = new THREE.Vector3();
   private crawlMotion?: JointMotion;
   private readonly motionPoint = new THREE.Vector3();
+  private collisionWorld:CollisionWorld|null=null;
+  setCollisionWorld(world:CollisionWorld):void{this.collisionWorld=world;}
+  wakeAll():void{for(const body of this.bodies){body.sleeping=false;body.quietTime=0;}}
   get crawlAnimationSource(): string { return this.crawlMotion?.source ?? 'procedural (loading)'; }
 
   private vehicleAt(x: number, z: number, floor: number, vehicles: readonly THREE.Group[]): boolean {
@@ -115,7 +122,9 @@ export class RagdollSystem {
         index === 10 || index === 13 ? 0.55 : index === 0 ? 0.72 : index === 3 ? 1.18 : 1;
       const velocity = impulseDirection.clone().multiplyScalar(impulseFactor)
         .add(new THREE.Vector3(variation, 0.12, Math.cos(index * 7.73) * 0.08));
-      return { position: point, previous: point.clone().addScaledVector(velocity, -1 / 60) };
+      const inverseMass = index === 0 ? 0.12 : index === 1 || index === 2 ? 0.18 :
+        index === 4 || index === 7 || index === 10 || index === 13 ? 0.28 : index === 3 ? 0.7 : 1;
+      return { position: point, previous: point.clone().addScaledVector(velocity, -1 / 60), inverseMass };
     });
     const palette = {
       shirt: new THREE.MeshStandardMaterial({ color: colors.shirt, roughness: 0.88 }),
@@ -164,7 +173,7 @@ export class RagdollSystem {
     const face = createFaceDecal('scared');
     details[0].add(face);
     details.forEach((mesh) => { mesh.castShadow = false; this.scene.add(mesh); });
-    const body: RagdollBody = { joints, links, constraints, details, face, woundMarks: [], materials: Object.values(palette), age: 0, life, floorLevel, size,
+    const body: RagdollBody = { joints, links, constraints, details, face, woundMarks: [], materials: Object.values(palette), age: 0, life, floorLevel, size, previousStep: 1 / 60,
       missing: new Set(missing), crawling: false, crawlDirection: new THREE.Vector3(0, 0, 1).applyAxisAngle(Y_AXIS, yaw), crawlAge: 0,
       across: new THREE.Vector3(1, 0, 0).applyAxisAngle(Y_AXIS, yaw) };
     for (const part of missing) this.markWound(body, part);
@@ -185,27 +194,38 @@ export class RagdollSystem {
   active(body: RagdollBody): boolean { return this.bodies.includes(body); }
   recoveryFinished(body: RagdollBody): boolean { return (body.recovery?.elapsed || 0) >= 1.05; }
 
+  canRecover(body: RagdollBody): boolean {
+    if (body.crawling || body.recovery) return false;
+    const pelvis = body.joints[0], floor = this.prefabs.supportHeight(pelvis.position.x, pelvis.position.z, pelvis.position.y);
+    const speed = pelvis.position.distanceTo(pelvis.previous) / body.previousStep;
+    return pelvis.position.y - floor < 1.4 * body.size && speed < 2.4 &&
+      !this.grid.water.currentAt(pelvis.position.x, pelvis.position.y, pelvis.position.z, this.waterCurrent);
+  }
+
   startRecovery(body: RagdollBody, yaw: number): void {
     if (body.recovery || body.crawling) return;
+    body.sleeping=false;body.quietTime=0;
     const floorY = this.prefabs.supportHeight(body.joints[0].position.x,body.joints[0].position.z,body.joints[0].position.y);
     body.recovery = { elapsed: 0, start: body.joints.map((joint) => joint.position.clone()),
       anchor: new THREE.Vector3(body.joints[0].position.x, floorY, body.joints[0].position.z), yaw };
   }
 
   impact(body: RagdollBody, point: THREE.Vector3, impulse: THREE.Vector3): void {
+    body.sleeping=false;body.quietTime=0;
     body.recovery = undefined;
     const joints = body.joints.map((joint, index) => ({ index, distance: joint.position.distanceToSquared(point) }))
       .sort((a, b) => a.distance - b.distance).slice(0, 4);
     for (const { index, distance } of joints) {
       const strength = 1 / (1 + distance * 2);
-      body.joints[index].previous.addScaledVector(impulse, -strength / 60);
+      body.joints[index].previous.addScaledVector(impulse, -strength * body.previousStep);
     }
   }
 
   launch(body: RagdollBody, impulse: THREE.Vector3): void {
+    body.sleeping=false;body.quietTime=0;
     body.recovery = undefined;
     body.crawling = false;
-    for (const joint of body.joints) joint.previous.addScaledVector(impulse, -1 / 60);
+    for (const joint of body.joints) joint.previous.addScaledVector(impulse, -body.previousStep);
   }
 
   setCrawlDirection(body: RagdollBody, direction: THREE.Vector3): void {
@@ -324,15 +344,23 @@ export class RagdollSystem {
   }
 
   update(dt: number, awakeAt?: (x: number, z: number) => boolean): void {
+    if (dt <= 0) return;
     const step = Math.min(dt, 1 / 30);
     for (const body of [...this.bodies]) {
       const pelvis = body.joints[0].position;
-      if (awakeAt && !awakeAt(pelvis.x, pelvis.z)) continue;
       body.age += dt;
       if (body.age > body.life) { this.remove(body); continue; }
+      if (awakeAt && !awakeAt(pelvis.x, pelvis.z)) continue;
+      if(body.sleeping && !body.crawling && !body.recovery) {
+        const movingCar=this.prefabs.vehicles.some(car=>car.position.distanceToSquared(pelvis)<64&&
+          !car.userData.destroyed&&(car.userData.autonomous===true||car.userData.playerDriving===true));
+        if(!movingCar)continue;
+        body.sleeping=false;body.quietTime=0;
+      }
       if (body.recovery) body.recovery.elapsed = Math.min(1.05, body.recovery.elapsed + dt);
       for (const joint of body.joints) {
-        const velocity = joint.position.clone().sub(joint.previous).multiplyScalar(0.97);
+        const velocity = joint.position.clone().sub(joint.previous)
+          .multiplyScalar(step / body.previousStep * Math.pow(0.97, step * 60));
         joint.previous.copy(joint.position);
         joint.position.add(velocity);
         joint.position.y -= 19 * step * step;
@@ -382,12 +410,27 @@ export class RagdollSystem {
             const standingLength = Math.hypot(from[0] - to[0], from[1] - to[1], from[2] - to[2]) * body.size;
             desiredLength = THREE.MathUtils.lerp(desiredLength, standingLength, Math.min(1, body.recovery.elapsed / 1.05));
           }
-          const correction = TEMP.multiplyScalar((length - desiredLength) / length * 0.5);
-          a.add(correction); b.sub(correction);
+          // Heavy trunk anchors resist more than wrists/ankles; a limb cannot drag
+          // the whole torso around as if every point had the same mass.
+          const wa = body.joints[constraint.a].inverseMass, wb = body.joints[constraint.b].inverseMass;
+          const correction = TEMP.multiplyScalar((length - desiredLength) / length / (wa + wb));
+          a.addScaledVector(correction, wa); b.addScaledVector(correction, -wb);
         }
         body.joints.forEach((joint, index) => this.collide(joint, index, body.floorLevel, body.size, nearbyVehicles));
       }
       if (body.crawling) this.keepCrawlClear(body, nearbyVehicles);
+      if(this.collisionWorld)for(let index=0;index<body.joints.length;index++) {
+        const joint=body.joints[index],radius=(index===3?.29:index===0||index===1?.22:.09)*body.size;
+        const contact=this.collisionWorld.sweepSphere(joint.previous,joint.position,radius);
+        if(contact.distanceToSquared(joint.position)>.000001)joint.previous.lerp(contact,.65);
+        joint.position.copy(contact);
+      }
+      if(!body.crawling&&!body.recovery&&!this.grid.water.at(pelvis.x,pelvis.z)&&body.age>1) {
+        const quiet=body.joints.every(joint=>joint.position.distanceToSquared(joint.previous)<step*step*.06);
+        body.quietTime=quiet?(body.quietTime??0)+dt:0;
+        if(body.quietTime>.8){body.sleeping=true;for(const joint of body.joints)joint.previous.copy(joint.position);}
+      }
+      body.previousStep = step;
       this.pose(body);
     }
     this.looseParts = this.looseParts.filter((part) => {
@@ -533,6 +576,7 @@ export class RagdollSystem {
       joint.previous.y = point.y + Math.min(0.035, Math.abs(joint.previous.y - point.y) * 0.11);
     }
     if (point.y > surface + 3.4) return;
+    if(this.collisionWorld)return;
     const bodyFloor = floorLevel > 0 && this.prefabs.upperFloorPresent(point.x, point.z, floorLevel)
       ? this.prefabs.floorHeightAt(point.x,point.z,floorLevel) : this.prefabs.supportHeight(point.x,point.z,point.y);
     if (this.openAt(point.x, point.z, bodyFloor, vehicles)) return;

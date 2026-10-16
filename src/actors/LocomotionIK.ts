@@ -3,9 +3,10 @@ import * as THREE from 'three';
 import { GridSystem } from '../world/GridSystem';
 import type { Weapon } from './InventorySystem';
 import { createHumanoid, type JointArm, type JointLeg } from './HumanoidModel';
-import { createWeaponModel } from './WeaponModel';
+import { createWeaponModel, disposeWeaponModel } from './WeaponModel';
 import { FLOOR_HEIGHT } from '../world/VoxelConstants';
 import { CANAL_BED_Y, CANAL_SURFACE_Y } from '../world/CanalWater';
+import type { CollisionWorld } from '../engine/CollisionWorld';
 
 export class LocomotionIK {
   readonly group = new THREE.Group();
@@ -32,6 +33,12 @@ export class LocomotionIK {
   private surfaceHeight = 0;
   private readonly contactPhysics = new GroundPhysics();
   private readonly waterCurrent = new THREE.Vector3();
+  private collisionWorld: CollisionWorld | null = null;
+  private readonly desiredVelocity = new THREE.Vector3();
+  private readonly movement = new THREE.Vector3();
+  readonly radius = .28;
+  readonly height = 2.36;
+  setCollisionWorld(world: CollisionWorld): void { this.collisionWorld = world; }
   floorLevel = 0;
   health = 100;
   stamina = 100;
@@ -59,6 +66,7 @@ export class LocomotionIK {
   }
 
   setWeapon(weapon: Weapon): void {
+    disposeWeaponModel(this.weaponMount);
     this.weaponMount.clear();
     this.weaponMount.position.x = weapon === 'rifle' || weapon === 'shotgun' ? 0.32 : 0.42;
     if (weapon !== 'fists') this.weaponMount.add(createWeaponModel(weapon));
@@ -135,14 +143,14 @@ export class LocomotionIK {
     this.jumpCooldown = Math.max(0, this.jumpCooldown - dt);
     const wantsSprint = sprint && input.lengthSq() > 0 && this.stamina > 2;
     this.stamina = THREE.MathUtils.clamp(this.stamina + dt * (wantsSprint ? -19 : 13), 0, 100);
-    const desired = new THREE.Vector3(input.x, 0, input.y);
+    const desired = this.desiredVelocity.set(input.x, 0, input.y);
     if (desired.lengthSq() > 1) desired.normalize();
     desired.multiplyScalar(wantsSprint ? 11.5 : 7.8);
     if(this.grid.water.currentAt(this.group.position.x,this.group.position.y,this.group.position.z,this.waterCurrent)) {
       desired.x=desired.x*.42+this.waterCurrent.x;
       desired.z=desired.z*.42+this.waterCurrent.z;
     }
-    this.velocity.lerp(desired, Math.min(1, dt * (desired.lengthSq() > 0 ? 7.3 : 4.5)));
+    this.velocity.lerp(desired, 1-Math.exp(-dt * (desired.lengthSq() > 0 ? 7.3 : 4.5)));
     if (this.velocity.lengthSq() < 0.005) this.velocity.set(0, 0, 0);
     // Sweep in short segments so low frame rates cannot skip a thin wall or
     // several stair risers. Vertical contact advances with each movement step.
@@ -150,6 +158,35 @@ export class LocomotionIK {
     const stepDt=Math.min(dt,.1)/steps;
     let stair=false;
     for(let i=0;i<steps;i++) {
+      if(this.collisionWorld) {
+        const position=this.group.position,currentSupport=this.supportAt(this.group.position.x,this.group.position.z);
+        let wasGrounded=this.contactPhysics.grounded||(this.contactPhysics.verticalSpeed<=0&&Math.abs(position.y-currentSupport.height)<.06);
+        if(!wasGrounded&&this.contactPhysics.verticalSpeed<=0) {
+          const feet=this.collisionWorld.move(position,this.movement.set(0,-.08,0),.12,.24);
+          if(feet.grounded){wasGrounded=true;this.contactPhysics.contact(true,false);}
+        }
+        const nextX=position.x+this.velocity.x*stepDt,nextZ=position.z+this.velocity.z*stepDt;
+        const target=this.supportAt(nextX,nextZ);
+        const navigable=target.deck||this.grid.walkable(nextX,nextZ)||this.grid.water.at(nextX,nextZ)||this.interiorWalkable?.(nextX,nextZ)===true||target.height<position.y-.52;
+        this.movement.set(navigable?this.velocity.x*stepDt:0,0,navigable?this.velocity.z*stepDt:0);
+        // Surface samplers still own terrain/ramp heights. Solid volumes own
+        // walls, stair risers, slabs, ceilings and oriented vehicle contacts.
+        const support=this.supportAt(position.x,position.z);
+        this.movement.y=this.contactPhysics.step(position.y,Math.min(position.y,support.height),stepDt)-position.y;
+        const contact=this.collisionWorld.moveCharacter(position,this.movement,this.radius,this.height,wasGrounded);
+        const movedX=contact.position.x-position.x,movedZ=contact.position.z-position.z;
+        if(Math.abs(this.movement.x)>.0001&&Math.abs(movedX)<Math.abs(this.movement.x)*.1)this.velocity.x*=.22;
+        if(Math.abs(this.movement.z)>.0001&&Math.abs(movedZ)<Math.abs(this.movement.z)*.1)this.velocity.z*=.22;
+        position.copy(contact.position);this.contactPhysics.contact(contact.grounded,contact.ceiling);
+        const landed=this.supportAt(position.x,position.z);
+        if(wasGrounded&&this.contactPhysics.verticalSpeed<=0&&landed.height>position.y&&landed.height-position.y<=.52) {
+          this.movement.set(0,landed.height-position.y,0);
+          const rise=this.collisionWorld.move(position,this.movement,this.radius,this.height);
+          position.copy(rise.position);
+        }
+        stair=landed.stair;this.surfaceHeight=landed.height;this.floorLevel=landed.level;
+        continue;
+      }
       const nextX=this.group.position.x+this.velocity.x*stepDt;
       if(this.canWalk(nextX,this.group.position.z))this.group.position.x=nextX;
       else this.velocity.x*=.22;

@@ -1,6 +1,9 @@
 import * as THREE from 'three';
 import './style.css';
 import { TouchStick } from './engine/TouchStick';
+import { FixedStep } from './engine/FixedStep';
+import { CollisionWorld } from './engine/CollisionWorld';
+import { PerformanceMonitor } from './engine/PerformanceMonitor';
 import { EventBus } from './core/EventBus';
 import { GridSystem } from './world/GridSystem';
 import { PrefabManager } from './world/PrefabManager';
@@ -18,6 +21,7 @@ import { CombatSystem } from './actors/CombatSystem';
 import { VehicleSystem } from './actors/VehicleSystem';
 import { RagdollSystem, type RagdollBody } from './actors/RagdollSystem';
 
+const bootStarted=performance.now();
 const app = document.querySelector<HTMLDivElement>('#app')!;
 app.innerHTML = `
   <div id="scene" aria-label="Ciudad voxel jugable"></div>
@@ -47,12 +51,13 @@ app.innerHTML = `
   <footer class="bottom-bar"><span>DISTRITO CERO <b> / </b> CIUDAD ABIERTA</span><span id="mission-progress">SUMINISTROS 0/3</span></footer>
   <aside class="hud controls" aria-label="Controles">
     <div><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd><span>MOVER</span></div>
-    <div><kbd>MOUSE</kbd><span>MIRAR SIN CLIC / DISPARAR / CLIC DERECHO PARA APUNTAR</span></div>
+    <div><kbd>MOUSE</kbd><span>CLIC PARA CAPTURAR · MIRAR / DISPARAR / APUNTAR</span></div>
     <div><kbd>1-6 / RUEDA</kbd><span>CAMBIAR ARMA</span></div>
-    <div><kbd>E</kbd><span>INTERACTUAR</span><kbd>R</kbd><span>RECARGAR</span></div>
+    <div><kbd>E</kbd><span>INTERACTUAR / HABLAR / AYUDAR</span><kbd>R</kbd><span>RECARGAR</span></div>
     <div><kbd>Q</kbd><span>BOTIQUÍN</span><kbd>SHIFT</kbd><span>CORRER</span></div>
     <div><kbd>SPACE</kbd><span>SALTAR</span><kbd>V</kbd><span>CÁMARA</span></div>
     <div><kbd>G</kbd><span>WIREFRAME</span></div>
+    <div><button id="quality-control" class="quality-control" type="button">CALIDAD · AUTO</button></div>
     <div id="input-hint" class="input-hint">Mouse y teclado activos</div>
   </aside>
   <div class="mobile-controls" aria-label="Controles táctiles">
@@ -72,33 +77,41 @@ const cityClock = new CityClock(Number.isFinite(hourFromUrl) && new URLSearchPar
 const grid = new GridSystem(seedFromUrl || undefined);
 const engine = new RenderEngine(sceneHost);
 engine.setTimeOfDay(cityClock);
-const prefabs = new PrefabManager(engine.scene, grid, cityClock.streetActivity);
+const loadingOverlay=document.querySelector<HTMLElement>('#overlay')!;
+loadingOverlay.classList.remove('hidden');
+document.querySelector('#overlay-title')!.textContent='PREPARANDO CIUDAD';
+document.querySelector<HTMLElement>('#resume')!.style.display='none';
+document.querySelector<HTMLElement>('#restart')!.style.display='none';
+// Let the loading screen paint before constructing the initial neighborhood.
+await new Promise<void>(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve())));
+const prefabs = new PrefabManager(engine.scene, grid, cityClock.streetActivity,true);
+async function prepareArea(bx:number,bz:number,radius:number):Promise<void> {
+  const expected=(Math.min(grid.roadX.length-2,bx+radius)-Math.max(0,bx-radius)+1)*
+    (Math.min(grid.roadZ.length-2,bz+radius)-Math.max(0,bz-radius)+1);
+  let shown=-1;
+  for(;;) {
+    prefabs.ensureAround(bx,bz,radius,1,8);prefabs.flushFarMeshes();prefabs.flushStaticDamage();
+    let ready=0;
+    for(let z=Math.max(0,bz-radius);z<=Math.min(grid.roadZ.length-2,bz+radius);z++)
+      for(let x=Math.max(0,bx-radius);x<=Math.min(grid.roadX.length-2,bx+radius);x++)if(prefabs.blockReady(x,z))ready++;
+    if(ready!==shown){document.querySelector('#overlay-copy')!.textContent=`Preparando calles y edificios · ${ready}/${expected}`;shown=ready;}
+    if(ready===expected)break;
+    await new Promise<void>(resolve=>requestAnimationFrame(()=>resolve()));
+  }
+}
+const initialBlock=grid.blockAt(grid.center+1,grid.center+1);
+await prepareArea(initialBlock.bx,initialBlock.bz,1);
 const cityLights = new CityLightSystem(engine.scene, prefabs);
 const landmarkView=new URLSearchParams(location.search).get('landmark');
 let landmarkReady = false;
 if(landmarkView==='canal') {
   const center=grid.blockAt(grid.center,grid.center);
-  prefabs.ensureAround(grid.terrain.canalColumn,center.bz,1,Infinity);
+  await prepareArea(grid.terrain.canalColumn,center.bz,1);
 }
+loadingOverlay.classList.add('hidden');
+document.querySelector<HTMLElement>('#resume')!.style.display='';
+document.querySelector<HTMLElement>('#restart')!.style.display='';
 engine.setGroundProbe((x,z,y)=>grid.surfaces.below(x,z,y,grid.groundHeight(x,z)));
-const cameraRaycaster = new THREE.Raycaster();
-engine.setCollisionProbe((from, to) => {
-  const direction = to.clone().sub(from);
-  const distance = direction.length();
-  cameraRaycaster.set(from, direction.normalize());
-  cameraRaycaster.far = distance;
-  const hits = cameraRaycaster.intersectObject(prefabs.buildings, true)
-    .concat(cameraRaycaster.intersectObjects(prefabs.interiorMeshesNear(from.x, from.z, distance + 2), false))
-    .sort((a, b) => a.distance - b.distance);
-  for (const hit of hits) {
-    if (!hit.object.visible || hit.object.parent?.visible === false) continue;
-    if (hit.object.userData.vehicleCore) continue;
-    const voxel = prefabs.voxelForHit(hit);
-    if (voxel !== null && !prefabs.voxels[voxel]?.alive) continue;
-    return hit.distance;
-  }
-  return null;
-});
 const destruction = new DestructionSystem(engine.scene, grid, prefabs, events);
 const ragdolls = new RagdollSystem(engine.scene, grid, prefabs);
 const player = new LocomotionIK(grid, engine.scene, (x, z) => prefabs.interiorWalkable(x, z), (x, z, currentY) => prefabs.stairSurface(x, z, currentY), (x, z, y) => prefabs.interiorObstacleAt(x, z, y), (x, z, level) => prefabs.upperFloorPresent(x, z, level),(x,z,level)=>prefabs.floorHeightAt(x,z,level));
@@ -133,16 +146,41 @@ if(landmarkView&&landmarkView!=='canal') {
   }
 }
 player.setActorCollision((x, z) => npcs.blocksPlayerAt(x, z));
+const staticCollision = new CollisionWorld((bounds, add) => prefabs.collisionBoxes(bounds, add, true, vehicles?.cameraVehicle));
+const collisionWorld = new CollisionWorld((bounds, add) => {
+  prefabs.collisionBoxes(bounds, add);
+  const centerX=(bounds.min.x+bounds.max.x)/2, centerZ=(bounds.min.z+bounds.max.z)/2;
+  const radius=Math.hypot(bounds.max.x-bounds.min.x,bounds.max.z-bounds.min.z)/2+1;
+  for(const npc of npcs.nearby(centerX,centerZ,radius)) {
+    if(!npc.alive||npc.ragdoll||npc.offDuty)continue;
+    const p=npc.group.position, lying=Boolean(npc.hitReaction);
+    add(p.x-.32,p.y,p.z-(lying ? .8 : .32),p.x+.32,p.y+(lying ? .55 : 2.36),p.z+(lying ? .8 : .32));
+  }
+});
+player.setCollisionWorld(collisionWorld);
+const environmentCollision=new CollisionWorld((bounds,add)=>prefabs.collisionBoxes(bounds,add));
+npcs.setCollisionWorld(environmentCollision);ragdolls.setCollisionWorld(environmentCollision);
+engine.setCameraSweep((from,to,radius)=>staticCollision.sweepSphere(from,to,radius));
+
 const inventory = new InventorySystem();
 const items = new ItemSystem(engine.scene, grid, inventory, events);
 const interiors = new InteriorSystem(prefabs, inventory, player);
 const combat = new CombatSystem(engine.scene, player, inventory, npcs, destruction, prefabs, events);
 const vehicles = new VehicleSystem(prefabs, grid, events, npcs, destruction);
 vehicles.setStreetActivity(cityClock.streetActivity);
+vehicles.setExitClear(position=>!collisionWorld.overlaps(position,player.radius,player.height));
 const contactShadows = new ContactShadowSystem(engine.scene, (x, z, y) => prefabs.supportHeight(x, z, y));
-events.on('terrainChanged', () => { engine.invalidateShadows(); contactShadows.invalidate(); });
-events.on('blast', () => engine.invalidateShadows());
+events.on('terrainChanged', () => { engine.invalidateShadows(); contactShadows.invalidate();ragdolls.wakeAll(); });
+events.on('blast', () => {engine.invalidateShadows();ragdolls.wakeAll();});
 const clock = new THREE.Clock();
+const physics = new FixedStep();
+const diagnostics = new PerformanceMonitor(new URLSearchParams(location.search).has('debug'));
+engine.onGpuTime=ms=>diagnostics.record('gpu',ms);
+const previousPlayerPosition = player.group.position.clone();
+const renderedPlayerPosition = player.group.position.clone();
+const physicalPlayerPosition = new THREE.Vector3();
+let lastFrameTime = performance.now();
+let lastFrameWorkMs=0;
 const keys = new Set<string>();
 const touchAvailable = 'ontouchstart' in window || navigator.maxTouchPoints > 0 || matchMedia('(pointer: coarse)').matches;
 app.dataset.inputMode = touchAvailable ? 'touch' : 'mouse';
@@ -182,6 +220,7 @@ window.addEventListener('gamepaddisconnected', () => {
   setInputMode(touchAvailable ? 'touch' : 'mouse');
 });
 function pollGamepad(): void {
+  if(gameOver){gamepadMove.set(0,0);gamepadAim.set(0,0);gamepadFireHeld=false;gamepadAimHeld=false;return;}
   const pad = Array.from(navigator.getGamepads?.() || []).find((item): item is Gamepad => Boolean(item?.connected));
   if (!pad) {
     gamepadMove.set(0, 0); gamepadAim.set(0, 0); gamepadFireHeld = false; gamepadAimHeld = false;
@@ -235,8 +274,6 @@ let queuedTapTime = 0;
 let aimingDownSights = false;
 let intimidationTimer = 0;
 let cameraDrag: { button: number; x: number; y: number; moved: boolean } | null = null;
-let freeLookPoint: { x: number; y: number } | null = null;
-let fallbackMouseInside = false;
 let pointerLockWarningShown = false;
 const cameraTouches = new Map<number, { x: number; y: number }>();
 let paused = false;
@@ -247,7 +284,6 @@ let damageCooldown = 0;
 let hudTimer = 0;
 let streamingTimer = 0;
 let citySimulationTimer = 0;
-let ragdollSimulationTimer = 0;
 let toastTimer = 0;
 let lastClockLabel = '';
 
@@ -291,7 +327,7 @@ function hurtPlayer(amount: number, message: string, recovery: number): void {
   if (!playerRagdoll) playerRagdoll = ragdolls.spawn(player.group.position, player.group.rotation.y,
     new THREE.Vector3(1.4, 2.3, 0.8), { shirt: '#21b9ad', pants: '#344a56', skin: '#e8bb94', shoes: '#243640' }, player.floorLevel);
   player.group.visible = false;
-  gameOver = true;
+  gameOver = true;clearHeldInput();if(document.pointerLockElement)document.exitPointerLock();
   $('#overlay').classList.remove('hidden');
   $('#overlay-title').textContent = 'CIUDAD EN SILENCIO';
   $('#overlay-copy').textContent = 'La simulación terminó. Cada nueva ciudad cuenta una historia diferente.';
@@ -338,14 +374,15 @@ function gamepadAimTarget(): THREE.Vector3 {
 
 const cameraModes: CameraMode[] = ['isometric', 'perspective', 'firstPerson'];
 function requestFirstPersonLock(): void {
-  if (touchAvailable || app.dataset.inputMode === 'gamepad') { app.dataset.pointerLock = 'fallback'; return; }
-  if (engine.mode !== 'firstPerson' || document.pointerLockElement === engine.renderer.domElement) return;
+  if (app.dataset.inputMode === 'touch' || app.dataset.inputMode === 'gamepad') { app.dataset.pointerLock = 'fallback'; return; }
+  if (paused || gameOver || engine.mode !== 'firstPerson' || document.pointerLockElement === engine.renderer.domElement) return;
   const canvas = engine.renderer.domElement;
   const onUnavailable = (): void => {
+    if(engine.mode !== 'firstPerson')return;
     app.dataset.pointerLock = 'fallback';
     if (!pointerLockWarningShown) {
       pointerLockWarningShown = true;
-      notify('ESTE NAVEGADOR NO CAPTURA EL MOUSE · ARRASTRA PARA GIRAR');
+      notify('ESTE NAVEGADOR NO CAPTURA EL MOUSE · CLIC DERECHO Y ARRASTRA PARA GIRAR');
     }
   };
   if (!canvas.requestPointerLock) { onUnavailable(); return; }
@@ -354,7 +391,6 @@ function requestFirstPersonLock(): void {
 }
 function setCameraMode(mode: CameraMode): void {
   if (mode !== 'firstPerson' && document.pointerLockElement) document.exitPointerLock();
-  freeLookPoint = null;
   aimingDownSights = false;
   engine.setAiming(false);
   app.dataset.aiming = 'false';
@@ -390,7 +426,7 @@ function fireAt(target: THREE.Vector3): void {
   }
   queuedTapTime = 0;
   if (engine.mode !== 'firstPerson' && aimClient && combat.readyIn === 0) target = pickTarget(aimClient.x, aimClient.y);
-  const message = combat.fire(target, engine.mode === 'firstPerson', aimingDownSights || gamepadAimHeld, pointerTargetIsNpc, pointerTargetHit);
+  const message = combat.fire(target, engine.mode === 'firstPerson', aimingDownSights || gamepadAimHeld, pointerTargetIsNpc, pointerTargetHit,engine.mode==='firstPerson'?engine.camera.position:undefined);
   if (message) notify(message, message.includes('SIN ') || message.includes('CIVIL') ? 'danger' : 'success');
 }
 
@@ -408,6 +444,7 @@ function intimidateAt(clientX: number, clientY: number): void {
 }
 
 engine.renderer.domElement.addEventListener('pointermove', (event) => {
+  if (paused || gameOver) return;
   if (event.pointerType === 'mouse' && Math.hypot(event.movementX, event.movementY) > 3) setInputMode('mouse');
   if (engine.mode === 'firstPerson' && document.pointerLockElement === engine.renderer.domElement) {
     if (cameraDrag && Math.hypot(event.movementX, event.movementY) > 1) cameraDrag.moved = true;
@@ -460,27 +497,15 @@ engine.renderer.domElement.addEventListener('pointermove', (event) => {
     $('.crosshair').style.top = `${event.clientY}px`;
   }
 });
-// Pointer lock is unavailable in some embedded browsers. Receive movement
-// across the entire game window, not only over the WebGL canvas or its HUD.
+// Uncaptured mouse motion only rotates during an explicit drag on the scene.
 window.addEventListener('pointermove', (event) => {
   if (engine.mode !== 'firstPerson' || event.pointerType !== 'mouse' ||
-      document.pointerLockElement === engine.renderer.domElement || paused) return;
-  fallbackMouseInside = event.clientX >= 0 && event.clientY >= 0 &&
-    event.clientX < window.innerWidth && event.clientY < window.innerHeight;
-  if (!fallbackMouseInside) { freeLookPoint = null; return; }
-  if (freeLookPoint) {
-    const dx = THREE.MathUtils.clamp(event.clientX - freeLookPoint.x, -90, 90);
-    const dy = THREE.MathUtils.clamp(event.clientY - freeLookPoint.y, -90, 90);
-    engine.orbit(dx, dy);
-    engine.follow(player.group.position, 0, vehicles.heading, vehicles.cameraVehicle, vehicles.steeringAngle);
-    pointerAim = screenAim(0, 0);
-  }
-  freeLookPoint = { x: event.clientX, y: event.clientY };
-});
-window.addEventListener('mouseout', (event) => {
-  if (!event.relatedTarget) { fallbackMouseInside = false; freeLookPoint = null; }
+      document.pointerLockElement === engine.renderer.domElement || paused || !cameraDrag) return;
+  const dx=event.clientX-cameraDrag.x,dy=event.clientY-cameraDrag.y;
+  engine.orbit(dx,dy);cameraDrag.x=event.clientX;cameraDrag.y=event.clientY;
 });
 engine.renderer.domElement.addEventListener('pointerdown', (event) => {
+  if(paused || gameOver)return;
   if (event.pointerType === 'touch') {
     event.preventDefault();
     engine.renderer.domElement.setPointerCapture(event.pointerId);
@@ -489,7 +514,12 @@ engine.renderer.domElement.addEventListener('pointerdown', (event) => {
   }
   if (engine.mode === 'firstPerson') {
     event.preventDefault();
-    requestFirstPersonLock();
+    const locked=document.pointerLockElement===engine.renderer.domElement;
+    if(!locked && app.dataset.pointerLock!=='fallback') { requestFirstPersonLock(); return; }
+    if(!locked && event.button===2) {
+      cameraDrag={button:2,x:event.clientX,y:event.clientY,moved:false};
+      engine.renderer.domElement.setPointerCapture(event.pointerId);
+    }
     if (event.button === 2) {
       aimingDownSights = true; intimidationTimer = 0;
       engine.setAiming(true); app.dataset.aiming = 'true';
@@ -529,21 +559,22 @@ window.addEventListener('pointerup', (event) => {
   if (event.button === 2) { aimingDownSights = false; engine.setAiming(false); app.dataset.aiming = 'false'; }
   cameraDrag = null; cameraTouches.delete(event.pointerId);
 });
-window.addEventListener('pointercancel', (event) => cameraTouches.delete(event.pointerId));
+window.addEventListener('pointercancel', (event) => { cameraTouches.delete(event.pointerId);cameraDrag=null;firing=false;aimingDownSights=false;engine.setAiming(false);app.dataset.aiming='false'; });
 document.addEventListener('pointerlockchange', () => {
   if (document.pointerLockElement === engine.renderer.domElement) {
     app.dataset.pointerLock = 'locked';
-    freeLookPoint = null;
-    return;
+      return;
   }
-  if (engine.mode === 'firstPerson') app.dataset.pointerLock = 'fallback';
-  freeLookPoint = null;
+  const wasLocked=app.dataset.pointerLock==='locked';
+  if (engine.mode === 'firstPerson') app.dataset.pointerLock = 'pending';
+  if(wasLocked && engine.mode==='firstPerson' && !paused && !gameOver)togglePause();
   cameraDrag = null;
   firing = false;
   aimingDownSights = false;
   engine.setAiming(false);
   app.dataset.aiming = 'false';
 });
+document.addEventListener('pointerlockerror',()=>{if(engine.mode==='firstPerson'){app.dataset.pointerLock='fallback';if(!pointerLockWarningShown){pointerLockWarningShown=true;notify('CLIC DERECHO Y ARRASTRA PARA GIRAR');}}});
 engine.renderer.domElement.addEventListener('contextmenu', (event) => event.preventDefault());
 engine.renderer.domElement.addEventListener('wheel', (event) => {
   event.preventDefault();
@@ -555,12 +586,14 @@ engine.renderer.domElement.addEventListener('wheel', (event) => {
   } else engine.zoom(event.deltaY);
 }, { passive: false });
 engine.renderer.domElement.addEventListener('pointerenter', () => $('.crosshair').classList.add('shown'));
-engine.renderer.domElement.addEventListener('pointerleave', () => { $('.crosshair').classList.remove('shown'); if (engine.mode !== 'firstPerson') freeLookPoint = null; });
+engine.renderer.domElement.addEventListener('pointerleave', () => { if(document.pointerLockElement!==engine.renderer.domElement)$('.crosshair').classList.remove('shown'); });
 
 function togglePause(): void {
   if (gameOver) return;
   paused = !paused;
-  if (paused) { queuedTapTime = 0; firing = false; }
+  clearHeldInput();physics.reset();citySimulationTimer=0;clock.getDelta();
+  if (paused && document.pointerLockElement)document.exitPointerLock();
+  if(!paused && engine.mode==='firstPerson')requestFirstPersonLock();
   $('#overlay').classList.toggle('hidden', !paused);
   $('#overlay-title').textContent = 'EN PAUSA';
   $('#overlay-copy').textContent = 'La ciudad seguirá en movimiento cuando regreses.';
@@ -568,30 +601,32 @@ function togglePause(): void {
 }
 
 function calmCivilians(descend = false): void {
+  if(paused||gameOver)return;
   if (vehicles.isDriving) { const message = vehicles.interact(player); if (message) notify(message); return; }
   const pickupMessage = player.floorLevel === 0 ? items.interact(player.group.position) : null;
   if (pickupMessage) { notify(pickupMessage, 'success'); player.setWeapon(inventory.weapon); player.animateUseItem(); return; }
   const interiorMessage = interiors.interact(player.group.position, descend);
   if (interiorMessage) { notify(interiorMessage, 'success'); player.animateUseItem(); return; }
-  if (player.floorLevel > 0) { notify('BAJA CAMINANDO POR LAS ESCALERAS'); return; }
-  const vehicleMessage = vehicles.interact(player);
+  const vehicleMessage = player.floorLevel === 0 ? vehicles.interact(player) : null;
   if (vehicleMessage) { notify(vehicleMessage, 'success'); return; }
   const negotiation = npcs.negotiate(player.group.position);
   if (negotiation === 'captured') { notify('ENEMIGO DESARMADO Y DETENIDO', 'success'); return; }
   if (negotiation === 'betrayal') { notify('FALSA RENDICIÓN · EL ENEMIGO ATACA', 'danger'); return; }
-  let count = 0;
-  for (const npc of npcs.npcs) {
-    if (npc.kind !== 'civilian' || !npc.alive) continue;
-    if (npc.group.position.distanceTo(player.group.position) < 6 && npc.panic > 0) {
-      npc.panic = Math.max(0, npc.panic - 0.5); count++;
-    }
+  const conversation = npcs.life.interact(player.group.position, {
+    threatening: aimingDownSights || gamepadAimHeld, medkits: inventory.medkits
+  });
+  if (conversation) {
+    if (conversation.usedMedkit) { inventory.medkits--; player.animateUseItem(); }
+    notify(conversation.text, conversation.tone);
+    return;
   }
-  notify(count ? `${count} CIVILES TRANQUILIZADOS` : 'NO HAY NADIE NI NADA CERCA PARA INTERACTUAR', count ? 'success' : 'info');
+  notify(player.floorLevel > 0 ? 'BAJA CAMINANDO POR LAS ESCALERAS' : 'ACÉRCATE A UNA PERSONA O UN OBJETO PARA INTERACTUAR');
 }
 
 function regenerate(): void { location.href = `${location.pathname}?seed=${Math.floor(Math.random() * 999999)}`; }
 
 window.addEventListener('keydown', (event) => {
+  if(gameOver){if(event.code==='KeyN')regenerate();return;}
   if (['Space', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(event.code)) event.preventDefault();
   keys.add(event.code);
   if (event.repeat) return;
@@ -612,15 +647,27 @@ window.addEventListener('keydown', (event) => {
   if (event.code === 'KeyR' && !paused) notify(combat.startReload() ? 'RECARGANDO…' : 'NO HAY MUNICIÓN QUE RECARGAR');
   if (event.code === 'Space' && !paused && !vehicles.isDriving) player.jump();
   if (event.code === 'Tab') $('.hotbar').classList.toggle('open');
-  if (event.code === 'KeyH') $('.controls').classList.toggle('open');
+  if (event.code === 'KeyH') toggleHelp();
   if (event.code === 'KeyC') engine.resetCamera(vehicles.heading ?? player.group.rotation.y);
   if (event.code === 'KeyV') setCameraMode(cameraModes[(cameraModes.indexOf(engine.mode) + 1) % cameraModes.length]);
   if (event.code === 'KeyG' && !event.repeat) toggleWireframe();
   if (/^Digit[1-6]$/.test(event.code)) selectWeapon(Number(event.code.slice(-1)));
 });
 window.addEventListener('keyup', (event) => keys.delete(event.code));
-window.addEventListener('blur', () => { touchMove.reset(); touchLook.reset(); keys.clear(); firing = false; queuedTapTime = 0; aimingDownSights = false; engine.setAiming(false); app.dataset.aiming = 'false'; });
-$('#help-button').addEventListener('click', () => $('.controls').classList.toggle('open'));
+function clearHeldInput():void {
+  touchMove.reset();touchLook.reset();keys.clear();firing=false;queuedTapTime=0;aimingDownSights=false;
+  gamepadFireHeld=false;gamepadAimHeld=false;cameraDrag=null;cameraTouches.clear();
+  engine.setAiming(false);app.dataset.aiming='false';
+}
+window.addEventListener('blur', () => {clearHeldInput();if(!paused&&!gameOver)togglePause();});
+document.addEventListener('visibilitychange',()=>{clock.getDelta();physics.reset();if(document.hidden&&!paused&&!gameOver)togglePause();});
+function toggleHelp():void {
+  const open=$('.controls').classList.toggle('open');
+  $('#help-button').setAttribute('aria-expanded',String(open));
+  if(open&&document.pointerLockElement){app.dataset.pointerLock='ui';clearHeldInput();document.exitPointerLock();}
+  else if(!open&&engine.mode==='firstPerson'&&!paused)requestFirstPersonLock();
+}
+$('#help-button').addEventListener('click',toggleHelp);
 $('#camera-reset').addEventListener('click', () => engine.resetCamera(vehicles.heading ?? player.group.rotation.y));
 $('#camera-view').addEventListener('click', () => {
   const menu = $('#camera-menu') as HTMLElement;
@@ -657,7 +704,7 @@ const mobileAim = () => {
 };
 function holdTouch(button: HTMLElement, press: () => void, release: () => void): void {
   button.addEventListener('pointerdown', event => {
-    event.preventDefault();setInputMode('touch');button.setPointerCapture(event.pointerId);press();
+    event.preventDefault();if(paused||gameOver)return;setInputMode('touch');button.setPointerCapture(event.pointerId);press();
   });
   button.addEventListener('pointerup', release);button.addEventListener('pointercancel', release);
   button.addEventListener('lostpointercapture', release);
@@ -701,7 +748,10 @@ function updateHud(dt: number): void {
   $('#medkit-value').textContent = `Q · BOTIQUÍN ×${inventory.medkits}`;
   $('#mission').textContent = inventory.delivered ? 'Refugio abastecido · Encargo completo' : inventory.supplies >= 3 ? 'Entrega las cajas en el refugio del parque' : `Recoge suministros · ${inventory.supplies}/3`;
   $('#mission-progress').textContent = inventory.delivered ? 'ENCARGO COMPLETADO' : `SUMINISTROS ${inventory.supplies}/3`;
-  $('#interaction-prompt').textContent = vehicles.isDriving ? vehicles.prompt(player.group.position) || '' : player.floorLevel > 0 ? interiors.prompt(player.group.position) || '' : items.prompt(player.group.position) || interiors.prompt(player.group.position) || vehicles.prompt(player.group.position) || '';
+  const interaction = vehicles.isDriving ? vehicles.prompt(player.group.position) || '' :
+    (player.floorLevel === 0 ? items.prompt(player.group.position) : null) || interiors.prompt(player.group.position) ||
+    (player.floorLevel === 0 ? vehicles.prompt(player.group.position) : null) || npcs.life.prompt(player.group.position) || '';
+  $('#interaction-prompt').textContent = interaction.replace(/^E ·/, app.dataset.inputMode === 'touch' ? 'USAR ·' : app.dataset.inputMode === 'gamepad' ? 'X ·' : 'E ·');
   $('#vehicle-speed').textContent = vehicles.isDriving ? `VEHÍCULO ${vehicles.speedKmh} KM/H` : '';
   $('#floor-level').textContent = player.floorLevel ? `PISO ${player.floorLevel + 1}` : '';
   $('#mobile-roll').textContent = vehicles.isDriving ? 'FRENAR' : 'SALTAR';
@@ -713,65 +763,11 @@ function updateHud(dt: number): void {
   $('#mobile-fire').textContent = inventory.weapon === 'fists' ? 'GOLPEAR' : inventory.weapon === 'charge' ? 'LANZAR' : 'DISPARAR';
 }
 
-function frame(): void {
-  requestAnimationFrame(frame);
-  if (document.hidden) return;
-  const dt = Math.min(0.05, clock.getDelta());
-  pollGamepad();
-  if (app.dataset.inputMode === 'touch' && !paused) {
-    touchSprint=touchMove.value.length()>.92;
-    if(touchLook.value.lengthSq()>.01) {
-      if(engine.mode==='isometric')touchAimDirection.copy(engine.movementVector(-touchLook.value.y,touchLook.value.x)).normalize();
-      else engine.orbit(touchLook.value.x*dt*240,touchLook.value.y*dt*210);
-    } else if(!firing && touchMove.value.lengthSq()>.01) {
-      touchAimDirection.copy(engine.movementVector(-touchMove.value.y,touchMove.value.x)).normalize();
-    }
-    pointerAim=mobileAim();if(!vehicles.isDriving&&(firing||aimingDownSights||touchLook.value.lengthSq()>.01))player.aimAt(pointerAim);
-    const reticle=$('.crosshair'), projected=pointerAim.clone().project(engine.camera);
-    reticle.style.left=engine.mode==='isometric'?`${(projected.x+1)*innerWidth/2}px`:'50%';
-    reticle.style.top=engine.mode==='isometric'?`${(1-projected.y)*innerHeight/2}px`:'50%';
-    reticle.classList.toggle('shown',firing||aimingDownSights||touchLook.value.lengthSq()>.01||engine.mode!=='isometric');
-  }
-  if (gamepadAim.lengthSq() > 0.025 && !paused) {
-    engine.orbit(gamepadAim.x * dt * 230, gamepadAim.y * dt * 210);
-    engine.follow(player.group.position, 0, vehicles.heading, vehicles.cameraVehicle, vehicles.steeringAngle);
-    if (engine.mode === 'firstPerson') pointerAim = screenAim(0, 0);
-  }
-  if (!paused && !gameOver) {
-    cityClock.update(dt);
-    prefabs.setStreetActivity(cityClock.streetActivity);
-    npcs.setStreetActivity(cityClock.streetActivity);
-    vehicles.setStreetActivity(cityClock.streetActivity);
-  }
-  engine.setTimeOfDay(cityClock);
-  if (cityClock.label !== lastClockLabel) {
-    lastClockLabel = cityClock.label;
-    document.querySelector('#clock-time')!.textContent = lastClockLabel;
-  }
-  if (paused) {
-    ragdollSimulationTimer = 0;
-  } else {
-    ragdollSimulationTimer += dt;
-    if (ragdollSimulationTimer >= 1 / 30) {
-      const physicsDt = Math.min(ragdollSimulationTimer, 1 / 30);
-      ragdollSimulationTimer -= physicsDt;
-      ragdolls.update(physicsDt, (x, z) => prefabs.isWorldActive(x, z) ||
-        Math.hypot(x - player.group.position.x, z - player.group.position.z) < 18);
-    }
-  }
+function simulate(dt:number):void {
+  cityClock.update(dt);
+  if(!paused&&!gameOver)ragdolls.update(dt,(x,z)=>prefabs.isWorldActive(x,z)||Math.hypot(x-player.group.position.x,z-player.group.position.z)<18);
   if (!paused && !gameOver) {
     damageCooldown = Math.max(0, damageCooldown - dt);
-    streamingTimer -= dt;
-    if (streamingTimer <= 0) {
-      streamingTimer = 0.05;
-      const generated = prefabs.ensureCameraVisible(engine.camera, player.group.position, vehicles.isDriving ? 2 : 1);
-      if (generated.length) {
-        const changedCells: number[] = [];
-        for (const bounds of generated) for (let z = bounds.z0; z < bounds.z1; z++) for (let x = bounds.x0; x < bounds.x1; x++) changedCells.push(grid.index(x, z));
-        events.emit('terrainChanged', { cells: changedCells });
-        generated.forEach((bounds) => npcs.populateBlock(bounds));
-      }
-    }
     if(landmarkView==='canal'&&!landmarkReady) {
       const access=[...grid.surfaces.surfaces.values()].find(s=>s.id.startsWith('riverwalk:')&&s.id.endsWith(':access'));
       if(access) {
@@ -781,9 +777,9 @@ function frame(): void {
       }
     }
     citySimulationTimer += dt;
-    const cityDt = citySimulationTimer >= 1 / 30 ? citySimulationTimer : 0;
+    const cityDt = citySimulationTimer + 1e-9 >= 1 / 30 ? 1 / 30 : 0;
     if (cityDt) {
-      citySimulationTimer = 0;
+      citySimulationTimer -= cityDt;
       vehicles.updateTraffic(cityDt, player);
     }
     const forward = THREE.MathUtils.clamp(Number(keys.has('KeyW') || keys.has('ArrowUp')) - Number(keys.has('KeyS') || keys.has('ArrowDown')) - gamepadMove.y - touchMove.value.y, -1, 1);
@@ -806,16 +802,8 @@ function frame(): void {
       handbrake: keys.has('Space') || gamepadBrakeHeld
     }, player, engine.movementVector(0, 1));
     else player.update(dt, input, destruction.colliders, keys.has('ShiftLeft') || keys.has('ShiftRight') || gamepadSprintHeld || touchSprint);
-    if (engine.mode === 'firstPerson' && document.pointerLockElement !== engine.renderer.domElement &&
-        fallbackMouseInside && freeLookPoint) {
-      const margin = 42;
-      const edgeX = freeLookPoint.x < margin ? (freeLookPoint.x - margin) / margin :
-        freeLookPoint.x > window.innerWidth - margin ? (freeLookPoint.x - (window.innerWidth - margin)) / margin : 0;
-      const edgeY = freeLookPoint.y < margin ? (freeLookPoint.y - margin) / margin :
-        freeLookPoint.y > window.innerHeight - margin ? (freeLookPoint.y - (window.innerHeight - margin)) / margin : 0;
-      if (edgeX || edgeY) engine.orbit(edgeX * dt * 175, edgeY * dt * 130);
-    }
     if (engine.mode === 'firstPerson') {
+      engine.follow(player.group.position,0,vehicles.heading,vehicles.cameraVehicle,vehicles.steeringAngle);
       pointerAim = screenAim(0, 0);
       if (!vehicles.isDriving) player.aimAt(pointerAim);
     }
@@ -833,13 +821,12 @@ function frame(): void {
       }
     }
     items.update(dt, (x, z) => prefabs.isWorldActive(x, z));
-    if (cityDt) npcs.update(cityDt);
+    if (cityDt) { npcs.setPlayerVelocity(player.velocity); npcs.update(cityDt); }
     if (damageCooldown === 0) {
       const nearby = npcs.npcs.some((npc) => npc.alive && npc.kind === 'enemy' && (npc.state === 'chase' || npc.state === 'cover' || npc.state === 'flank') && npc.group.position.distanceTo(player.group.position) < 2.1);
       if (nearby && !vehicles.isDriving) hurtPlayer(5, 'ENEMIGO CERCA · RUEDA O CONTRAATACA', 2.5);
     }
     if (toastTimer > 0) { toastTimer -= dt; if (toastTimer <= 0) $('#toast').classList.remove('visible'); }
-    engine.follow(player.group.position, dt, vehicles.heading, vehicles.cameraVehicle, vehicles.steeringAngle);
     cityLights.update(dt, player.group.position, cityClock);
     if (aimingDownSights || gamepadAimHeld) {
       intimidationTimer -= dt;
@@ -854,14 +841,78 @@ function frame(): void {
         else if (aimClient) intimidateAt(aimClient.x, aimClient.y);
       }
     }
-    npcs.orientFaces(engine.camera.position, engine.mode === 'isometric', dt);
-    engine.setViewWeapon(inventory.weapon, !vehicles.isDriving && !playerRagdoll && !gameOver);
-    engine.updateViewWeapon(dt, player.velocity.length(), player.recoil);
-    prefabs.flushFarMeshes();
-    prefabs.flushStaticDamage();
+  }
+}
+
+function frame(): void {
+  requestAnimationFrame(frame);
+  const elapsed=clock.getDelta(),now=performance.now();
+  if(document.hidden){physics.reset();lastFrameTime=now;return;}
+  const frameMs=now-lastFrameTime;diagnostics.record('frameInterval',frameMs);lastFrameTime=now;
+  const workStarted=performance.now();
+  engine.adaptQuality(frameMs,Math.min(.5,elapsed),paused||gameOver||lastFrameWorkMs>10);
+  prefabs.viewDistance=engine.viewDistance;
+  const dt=Math.min(.1,elapsed);
+  pollGamepad();
+  if (app.dataset.inputMode === 'touch' && !paused) {
+    touchSprint=touchMove.value.length()>.92;
+    if(touchLook.value.lengthSq()>.01) {
+      if(engine.mode==='isometric')touchAimDirection.copy(engine.movementVector(-touchLook.value.y,touchLook.value.x)).normalize();
+      else engine.orbit(touchLook.value.x*dt*240,touchLook.value.y*dt*210);
+    } else if(!firing && touchMove.value.lengthSq()>.01) {
+      touchAimDirection.copy(engine.movementVector(-touchMove.value.y,touchMove.value.x)).normalize();
+    }
+    pointerAim=mobileAim();if(!vehicles.isDriving&&(firing||aimingDownSights||touchLook.value.lengthSq()>.01))player.aimAt(pointerAim);
+    const reticle=$('.crosshair'), projected=pointerAim.clone().project(engine.camera);
+    reticle.style.left=engine.mode==='isometric'?`${(projected.x+1)*innerWidth/2}px`:'50%';
+    reticle.style.top=engine.mode==='isometric'?`${(1-projected.y)*innerHeight/2}px`:'50%';
+    reticle.classList.toggle('shown',firing||aimingDownSights||touchLook.value.lengthSq()>.01||engine.mode!=='isometric');
+  }
+  if (gamepadAim.lengthSq() > 0.025 && !paused) {
+    engine.orbit(gamepadAim.x * dt * 230, gamepadAim.y * dt * 210);
+    engine.follow(player.group.position, 0, vehicles.heading, vehicles.cameraVehicle, vehicles.steeringAngle);
+    if (engine.mode === 'firstPerson') pointerAim = screenAim(0, 0);
+  }
+
+  if(!paused&&!gameOver)diagnostics.measure('simulation',()=>physics.advance(elapsed,step=>{
+    previousPlayerPosition.copy(player.group.position);simulate(step);
+  }));
+  else physics.reset();
+  if (!paused && !gameOver) {
+    prefabs.setStreetActivity(cityClock.streetActivity);
+    npcs.setStreetActivity(cityClock.streetActivity, cityClock.hour);
+    vehicles.setStreetActivity(cityClock.streetActivity);
+  }
+  engine.setTimeOfDay(cityClock);
+  if (cityClock.label !== lastClockLabel) {
+    lastClockLabel = cityClock.label;
+    document.querySelector('#clock-time')!.textContent = lastClockLabel;
+  }
+
+  if(!paused&&!gameOver) {
+    streamingTimer -= dt;
+    if (streamingTimer <= 0) {
+      streamingTimer = 0.05;
+      const generated = diagnostics.measure('streaming',()=>prefabs.ensureCameraVisible(engine.camera, player.group.position, vehicles.isDriving ? 2 : 1));
+      if (generated.length) {
+        const changedCells: number[] = [];
+        for (const bounds of generated) for (let z = bounds.z0; z < bounds.z1; z++) for (let x = bounds.x0; x < bounds.x1; x++) changedCells.push(grid.index(x, z));
+        events.emit('terrainChanged', { cells: changedCells });
+        generated.forEach((bounds) => npcs.populateBlock(bounds));
+      }
+    }
+    diagnostics.measure('meshQueue',()=>{prefabs.flushFarMeshes();prefabs.flushStaticDamage();});
     updateHud(dt);
   }
-  npcs.renderActors();
+  renderedPlayerPosition.copy(player.group.position);
+  if(!paused&&!gameOver&&!vehicles.isDriving&&!playerRagdoll&&renderedPlayerPosition.distanceToSquared(previousPlayerPosition)<4)
+    renderedPlayerPosition.lerpVectors(previousPlayerPosition,player.group.position,physics.alpha);
+  engine.follow(renderedPlayerPosition,dt,vehicles.heading,vehicles.cameraVehicle,vehicles.steeringAngle);
+  npcs.orientFaces(engine.camera.position,engine.mode==='isometric',dt);
+  engine.setViewWeapon(inventory.weapon,!vehicles.isDriving&&!playerRagdoll&&!gameOver);
+  engine.updateViewWeapon(dt,player.velocity.length(),player.recoil);
+  npcs.beginRender(paused||gameOver?1:(citySimulationTimer+physics.alpha*physics.step)*30);
+  diagnostics.measure('actors',()=>npcs.renderActors(engine.camera));
   contactShadows.beginFrame(player.group.position);
   contactShadows.add(player.group, 1.3, 1.1);
   for (const npc of npcs.npcs) if (!npc.ragdoll && !npc.offDuty) contactShadows.add(npc.group, 1.3, 1.1);
@@ -872,13 +923,37 @@ function frame(): void {
   }
   ragdolls.drawContactShadows(contactShadows);
   contactShadows.endFrame(!engine.isWireframe);
-  engine.render();
+  physicalPlayerPosition.copy(player.group.position);player.group.position.copy(renderedPlayerPosition);
+  lastFrameWorkMs=performance.now()-workStarted;
+  try{diagnostics.measure('render',()=>engine.render());}
+  finally{player.group.position.copy(physicalPlayerPosition);npcs.endRender();}
 }
 
+const startupMs=performance.now()-bootStarted;
 // Opt-in diagnostics for repeatable city/physics checks without adding HUD.
 if (new URLSearchParams(location.search).has('debug')) {
-  Object.assign(window, { __cityDebug: { engine, grid, prefabs, player, npcs, ragdolls, destruction, vehicles, contactShadows, cityClock, setCameraMode } });
+  Object.assign(window, { __cityDebug: { diagnostics, physics,startupMs,
+    sample:async(seconds=10)=>{
+      diagnostics.reset();const started=performance.now(),duration=THREE.MathUtils.clamp(seconds,1,60)*1000;
+      await new Promise<void>(resolve=>{const tick=()=>{if(performance.now()-started>=duration)resolve();else requestAnimationFrame(tick);};requestAnimationFrame(tick);});
+      return diagnostics.snapshot();
+    },
+    snapshot:()=>{
+      const gl=engine.renderer.getContext(),ext=gl.getExtension('WEBGL_debug_renderer_info');
+      return {seed:grid.seed,hour:cityClock.hour,url:location.href,startupMs,viewport:[innerWidth,innerHeight],devicePixelRatio,
+        quality:{mode:engine.quality.mode,level:engine.quality.level,renderPixelRatio:engine.renderer.getPixelRatio()},
+        hardware:{renderer:ext?gl.getParameter(ext.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER),gpuTiming:engine.gpuTimer.available},
+        timings:diagnostics.snapshot(),streaming:prefabs.streamingStats(),pending:prefabs.pendingWork,
+        renderer:engine.renderer.info.render,memory:engine.renderer.info.memory,droppedSimulationSeconds:physics.droppedSeconds};
+    }, collisionWorld, staticCollision, engine, grid, prefabs, player, npcs, ragdolls, destruction, vehicles, contactShadows, cityClock, inventory, items, interiors, setCameraMode } });
 }
+const qualityModes=['auto','low','medium','high'] as const;
+const qualityNames={auto:'AUTO',low:'BAJA',medium:'MEDIA',high:'ALTA'};
+$('#quality-control').textContent=`CALIDAD · ${qualityNames[engine.quality.mode]}`;
+$('#quality-control').addEventListener('click',()=>{
+  const next=qualityModes[(qualityModes.indexOf(engine.quality.mode)+1)%qualityModes.length];
+  engine.setQuality(next);$('#quality-control').textContent=`CALIDAD · ${qualityNames[next]}`;
+});
 frame();
 
-window.addEventListener('beforeunload', () => { contactShadows.dispose(); npcs.dispose(); prefabs.dispose(); engine.dispose(); });
+window.addEventListener('beforeunload', () => { diagnostics.dispose();cityLights.dispose();vehicles.dispose();contactShadows.dispose(); npcs.dispose(); prefabs.dispose(); engine.dispose(); });

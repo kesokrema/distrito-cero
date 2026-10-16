@@ -101,10 +101,10 @@ export class CombatSystem {
   }
 
   fire(target: THREE.Vector3, directAim = false, ads = false, preciseAim = false,
-    selectedPart: { npc: NPC; part: BodyPart; point: THREE.Vector3 } | null = null): string | null {
+    selectedPart: { npc: NPC; part: BodyPart; point: THREE.Vector3 } | null = null,viewOrigin?:THREE.Vector3): string | null {
     const weapon = this.inventory.weapon;
     if (this.cooldown > 0 || this.reloadTime > 0) return null;
-    const origin = this.player.group.position.clone().add(new THREE.Vector3(0, 1.78, 0));
+    const origin = directAim&&viewOrigin?viewOrigin.clone():this.player.group.position.clone().add(new THREE.Vector3(0, 1.78, 0));
     const aim = target.clone();
     if (weapon !== 'charge' && !directAim && !preciseAim && aim.y < this.player.group.position.y + 0.6) aim.y = this.player.group.position.y + 1.5;
     this.player.aimAt(aim);
@@ -115,6 +115,7 @@ export class CombatSystem {
       this.cooldown = 0.95;
       this.player.animateFire();
       const muzzle = origin.clone().addScaledVector(direction, 0.62);
+      const obstruction=this.missileHit(origin,muzzle);if(obstruction)muzzle.copy(obstruction).addScaledVector(direction,-.02);
       this.muzzleFlash(muzzle, 0.38);
       this.missiles.launch(muzzle, direction, (point) => {
         this.npcs.hitByMissile(point, 4.2);
@@ -158,9 +159,9 @@ export class CombatSystem {
       this.raycaster.far = maxRange;
       const voxelHit = this.raycaster.intersectObject(this.prefabs.buildings, true).find((hit) => {
         const index = this.prefabs.voxelForHit(hit);
-        return index !== null && this.prefabs.voxels[index]?.alive;
+        return index !== null && this.prefabs.voxels[index]?.alive && (typeof this.prefabs.pieceForHit!=='function'||this.prefabs.pieceForHit(hit)!==null);
       });
-      const interiorHit = this.raycaster.intersectObjects(interiorMeshes, false)[0];
+      const interiorHit = this.raycaster.intersectObjects(interiorMeshes, false).find(hit=>typeof this.prefabs.interiorVoxelForHit!=='function'||this.prefabs.interiorVoxelForHit(hit)!==null);
       const groundHit = this.raycaster.intersectObjects(
         this.prefabs.groundMeshesNear?.(origin.x, origin.z, maxRange) ?? [], false)[0];
       const npcHit = this.npcs.raycast(this.raycaster);
@@ -221,11 +222,11 @@ export class CombatSystem {
     this.raycaster.far = distance;
     const voxelHit = this.raycaster.intersectObject(this.prefabs.buildings, true).find((hit) => {
       const index = this.prefabs.voxelForHit(hit);
-      return index !== null && this.prefabs.voxels[index]?.alive;
+      return index !== null && this.prefabs.voxels[index]?.alive && (typeof this.prefabs.pieceForHit!=='function'||this.prefabs.pieceForHit(hit)!==null);
     });
     const interiorHit = this.raycaster.intersectObjects(
       this.prefabs.interiorMeshesNear(from.x, from.z, distance + 3), false
-    ).find((hit) => this.prefabs.interiorPieceForHit(hit)?.alive);
+    ).find((hit) => this.prefabs.interiorPieceForHit(hit)?.alive&&(typeof this.prefabs.interiorVoxelForHit!=='function'||this.prefabs.interiorVoxelForHit(hit)!==null));
     const npcHit = this.npcs.raycast(this.raycaster);
     const hit = [voxelHit, interiorHit, npcHit].filter((candidate) => candidate)
       .sort((a, b) => a!.distance - b!.distance)[0];

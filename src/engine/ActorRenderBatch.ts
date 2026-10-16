@@ -6,6 +6,9 @@ export class ActorRenderBatch {
   private sources = new Map<THREE.Group, THREE.Mesh[]>();
   private batches = new Map<THREE.BufferGeometry, THREE.InstancedMesh>();
   private readonly material = new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: .86 });
+  private readonly frustum = new THREE.Frustum();
+  private readonly projection = new THREE.Matrix4();
+  private readonly sphere = new THREE.Sphere(new THREE.Vector3(), 2.8);
   constructor(private scene: THREE.Scene) {}
 
   add(root: THREE.Group): void {
@@ -25,10 +28,15 @@ export class ActorRenderBatch {
     this.sources.set(root, meshes);
   }
 
-  update(): void {
+  remove(root: THREE.Group): void { this.sources.delete(root); }
+  get sourceCount(): number { return this.sources.size; }
+
+  update(camera?: THREE.Camera): void {
+    if(camera){camera.updateMatrixWorld();this.frustum.setFromProjectionMatrix(this.projection.multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse));}
     for (const batch of this.batches.values()) batch.count = 0;
     for (const [root, meshes] of this.sources) {
       if (!root.parent || !root.visible) continue;
+      if(camera){this.sphere.center.copy(root.position);this.sphere.center.y+=1;if(!this.frustum.intersectsSphere(this.sphere))continue;}
       root.updateWorldMatrix(true, true);
       for (const mesh of meshes) {
         let visible = true;
@@ -45,8 +53,10 @@ export class ActorRenderBatch {
     }
     for (const batch of this.batches.values()) {
       batch.visible = batch.count > 0; batch.instanceMatrix.needsUpdate = true;
+      batch.instanceMatrix.clearUpdateRanges();batch.instanceMatrix.addUpdateRange(0,batch.count*16);
       if (batch.instanceColor) batch.instanceColor.needsUpdate = true;
+      if (batch.instanceColor) {batch.instanceColor.clearUpdateRanges();batch.instanceColor.addUpdateRange(0,batch.count*3);}
     }
   }
-  dispose(): void { for (const batch of this.batches.values()) { this.scene.remove(batch); batch.dispose(); } this.material.dispose(); }
+  dispose(): void { for (const batch of this.batches.values()) { this.scene.remove(batch); batch.dispose(); } this.sources.clear();this.batches.clear();this.material.dispose(); }
 }

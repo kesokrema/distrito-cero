@@ -1,6 +1,11 @@
+import { meshGround, type GroundRequest } from '../src/world/GroundMesher';
+import { CollisionWorld } from '../src/engine/CollisionWorld';
+import './stabilization.test';
+import { meshDecorationPieces, type DecorationPieceData } from '../src/world/DecorationMesher';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
+import './npc-life.test';
 import * as THREE from 'three';
 import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
 import { GridSystem } from '../src/world/GridSystem';
@@ -41,10 +46,11 @@ class MeshWorker {
   onmessage?: (event: { data: unknown }) => void;
   postMessage(message: { id: number; pieces: Float32Array | unknown[]; references?: Uint32Array; renderOwners?: Uint8Array;
     voxelSize?:number; latticeOffset?:number[]; revision?:number; gridSize?:number }): void {
+    structuredClone(message); // Enforce the real Worker data contract, including generated surface callbacks.
+    if((message as unknown as GroundRequest).kind==='ground'){MeshWorker.jobs.push(()=>this.onmessage?.({data:meshGround(message as unknown as GroundRequest)}));return;}
     if (message.gridSize !== undefined) {
       MeshWorker.jobs.push(() => this.onmessage?.({ data: { id: message.id, revision: message.revision,
-        positions: new Float32Array(), normals: new Float32Array(), colors: new Float32Array(), indexes: new Uint32Array(),
-        voxelForFace: new Uint32Array(), exposedFaces: 0, quads: 0 } }));
+        ...meshDecorationPieces(message.pieces as DecorationPieceData[], message.gridSize!,message.latticeOffset) } }));
       return;
     }
     const { id, pieces, references, renderOwners, voxelSize, latticeOffset } = message as {
@@ -64,12 +70,12 @@ Object.assign(globalThis, {
   document: { createElement: () => ({ width: 0, height: 0, getContext: () => ({ fillRect() {}, strokeRect() {}, fillText() {} }) }) }
 });
 function drain(world: PrefabManager): void {
-  for (let i = 0; i < 120; i++) {
-    world.flushFarMeshes();
-    if (!MeshWorker.jobs.length) return;
+  for (let i = 0; i < 2000; i++) {
+    world.flushFarMeshes();world.flushStaticDamage();
+    if (!MeshWorker.jobs.length && !world.pendingWork) return;
     MeshWorker.jobs.splice(0).forEach((job) => job());
   }
-  throw new Error('Mesh queue did not drain');
+  throw new Error('Mesh queue did not drain '+JSON.stringify({pending:world.pendingWork,stats:world.streamingStats(),jobs:MeshWorker.jobs.length,decoration:(world as any).decorationRequests.size,dirty:(world as any).dirtyAggregates.size,completed:(world as any).completedDecorations.length,block:Boolean((world as any).pendingBlock)}));
 }
 
 test('large world allocates only requested cells', () => {
@@ -566,8 +572,9 @@ test('real chunks retain precise damage, open entrances, floor coverage and boun
   });
   assert.ok(largestWallQuad > S * S * 30, 'intact walls should contain large two-triangle faces');
   assert.ok(largestRoofQuad > S * S * 30, 'intact roofs should contain large two-triangle faces');
+  // Drain now includes damage/cutout remeshing, whose exposed banks add triangles.
   assert.ok(initial.groundTriangles > 0);
-  assert.ok(initial.groundTriangles < initial.unmergedGroundTriangles / 4);
+  assert.ok(initial.groundTriangles < initial.unmergedGroundTriangles / 2,JSON.stringify(initial));
   const floorSurfaces: THREE.Mesh[] = [], detailSurfaces: THREE.Mesh[] = [];
   scene.traverse((object) => {
     if (object instanceof THREE.Mesh && object.userData.aggregateSurface && object.userData.surfaceKind === 'floor') floorSurfaces.push(object);
@@ -576,20 +583,21 @@ test('real chunks retain precise damage, open entrances, floor coverage and boun
   assert.ok(floorSurfaces.length > 0, 'intact building floors should render as combined surfaces');
   const floorOriginalTriangles = floorSurfaces.reduce((sum, mesh) => sum + mesh.userData.surfaceStats.originalTriangles, 0);
   const floorTriangles = floorSurfaces.reduce((sum, mesh) => sum + mesh.userData.surfaceStats.triangles, 0);
-  assert.ok(floorTriangles < floorOriginalTriangles / 4);
+  assert.ok(floorTriangles < floorOriginalTriangles / 4,JSON.stringify({floorTriangles,floorOriginalTriangles,surfaces:floorSurfaces.map(m=>m.userData.surfaceStats)}));
   assert.ok(detailSurfaces.length > 0, 'static building details should render as combined surfaces');
   const detailOriginalTriangles = detailSurfaces.reduce((sum, mesh) => sum + mesh.userData.surfaceStats.originalTriangles, 0);
   const detailTriangles = detailSurfaces.reduce((sum, mesh) => sum + mesh.userData.surfaceStats.triangles, 0);
   assert.ok(detailTriangles < detailOriginalTriangles * .9, 'each accepted aggregate must reduce the already greedy source geometry by at least 10%');
   const combinedFloor = floorSurfaces[0];
   const floorPiece = world.interiorPieces.find((piece) => piece.aggregate?.mesh === combinedFloor)!;
+  assert.ok(world.interiorMeshesNear(floorPiece.center.x,floorPiece.center.z,2).includes(combinedFloor),'compressed interiors remain hittable by combat rays');
   const floorHit = new THREE.Raycaster(new THREE.Vector3(floorPiece.center.x, floorPiece.bounds.max.y + 2, floorPiece.center.z),
     new THREE.Vector3(0, -1, 0)).intersectObject(combinedFloor)[0];
   assert.ok(floorHit && world.interiorPieceForHit(floorHit) === floorPiece);
   const floorVoxel = world.interiorVoxelForHit(floorHit);
   assert.notEqual(floorVoxel, null);
   world.eraseSceneVoxels(floorPiece, [floorVoxel!]);
-  world.flushStaticDamage();
+  drain(world);
   assert.ok(combinedFloor.parent, 'a damaged floor keeps its compressed render object');
   assert.ok(!floorPiece.mesh.visible && !floorPiece.mask[floorVoxel!], 'logical voxel damage does not restore source meshes');
   const combinedDetail = detailSurfaces.find((mesh) => {
@@ -604,7 +612,7 @@ test('real chunks retain precise damage, open entrances, floor coverage and boun
   const detailVoxel = world.interiorVoxelForHit(detailHit);
   assert.notEqual(detailVoxel, null);
   world.eraseSceneVoxels(detailPiece, [detailVoxel!]);
-  world.flushStaticDamage();
+  drain(world);
   assert.ok(combinedDetail.parent);
   assert.ok(!detailPiece.mesh.visible && !detailPiece.mask[detailVoxel!]);
   assert.ok(Object.keys(grid.cells).length < grid.size * grid.size / 20);
@@ -639,7 +647,7 @@ test('real chunks retain precise damage, open entrances, floor coverage and boun
   assert.notDeepEqual([...roadPixels.slice(pixelIndex, pixelIndex + 3)], roadPixelBefore,
     'the damaged voxel surface is visibly replaced by a darker exposed layer');
   assert.equal(grid.groundHeight(roadX, roadZ), roadHeight-CITY_VOXEL_SIZE, 'the destroyed road layer reveals a lower solid support');
-  for(let i=0;i<30;i++)world.flushGroundDamage();
+  drain(world);
   assert.ok(Array.from(groundChunk!.geometry.getAttribute('position').array).every(Number.isFinite), 'craters never create NaN terrain geometry');
   assert.ok(groundChunk!.geometry.getAttribute('position').array.some((value,index)=>index%3===1&&Math.abs(value-(roadHeight-CITY_VOXEL_SIZE))<1e-5), 'the road crater has real lower geometry');
   const exposedBefore=[...roadPixels.slice(pixelIndex,pixelIndex+3)];
@@ -661,11 +669,11 @@ test('real chunks retain precise damage, open entrances, floor coverage and boun
   const edgeMeshes=world.groundMeshesNear(edgeX,edgeZ,1);
   assert.ok(curbProbe.intersectObjects(edgeMeshes,false).length,'the intact sidewalk edge has a visible riser');
   assert.equal(collisionDamage.damagePavementSurface(walkX,walkZ,3),true,'sidewalk voxels accept projectile damage');
-  for(let i=0;i<30;i++)world.flushGroundDamage();
+  drain(world);
   assert.ok(Math.abs(grid.groundHeight(walkX,walkZ)-(walkHeight-CITY_VOXEL_SIZE))<1e-5,'paving reveals exactly one lower support layer');
   assert.ok(Math.abs(sidewalkProbe.intersectObjects(sidewalkMeshes,false)[0].point.y-grid.groundHeight(walkX,walkZ))<1e-5,'destroyed paving stays closed and matches physics');
   collisionDamage.blast(edgeX,edgeZ,1.4,'player',walkHeight+.2);
-  for(let i=0;i<30;i++)world.flushGroundDamage();
+  drain(world);
   assert.equal(curbProbe.intersectObjects(edgeMeshes,false).length,0,'an explosion retires the curb with the adjoining pavement');
   assert.ok(Math.abs(grid.groundHeight(walkX,walkZ)-(walkHeight-CITY_VOXEL_SIZE))<1e-5,'repeated damage cannot dig beyond the protected foundation');
   const canalBounds = grid.terrain.canalBounds();
@@ -798,7 +806,8 @@ test('real chunks retain precise damage, open entrances, floor coverage and boun
   assert.ok(visibleAtHome > 0);
   camera.position.set(2000, 60, 0); camera.lookAt(2000, 0, 0);
   world.updateCameraVisibility(camera, new THREE.Vector3());
-  assert.equal(world.streamingStats().renderedBlocks, 0, 'off-camera chunk scene roots are detached');
+  assert.equal(world.streamingStats().renderedBlocks,0,'off-camera scenery does not consume draws');
+  assert.equal(world.isWorldActive(0,0),true,'the nearby simulation and collisions stay active when looking away');
   camera.position.set(45, 60, 45); camera.lookAt(0, 0, 0);
   world.updateCameraVisibility(camera, new THREE.Vector3());
   assert.equal(world.streamingStats().renderedBlocks, visibleAtHome);
@@ -1307,6 +1316,7 @@ test('surface layers preserve the lower promenade and pathfinding does not telep
 });
 
 test('landscape access paths stay clear, canal bridges have human clearance and nature has distinct species', () => {
+  Object.assign(globalThis,{Worker:MeshWorker});
   const grid=new GridSystem(919809),scene=new THREE.Scene(),world=new PrefabManager(scene,grid);
   const center=grid.blockAt(grid.center,grid.center);
   world.ensureAround(grid.terrain.canalColumn,center.bz,1,Infinity);drain(world);scene.updateMatrixWorld(true);
@@ -1458,6 +1468,7 @@ test('seed 828507 has level roads and the player traverses entrances, stairs, ra
   const walker=new LocomotionIK(grid,scene,(x,z)=>world.interiorWalkable(x,z),
     (x,z,y)=>world.stairSurface(x,z,y),(x,z,y)=>world.interiorObstacleAt(x,z,y),
     (x,z,l)=>world.upperFloorPresent(x,z,l),(x,z,l)=>world.floorHeightAt(x,z,l));
+  walker.setCollisionWorld(new CollisionWorld((bounds,add)=>world.collisionBoxes(bounds,add,false)));
   const walkTo=(x:number,z:number,label:string)=>{
     for(let i=0;i<1400;i++) {
       const delta=new THREE.Vector2(x-walker.group.position.x,z-walker.group.position.z);
@@ -1523,7 +1534,7 @@ test('seed 828507 has level roads and the player traverses entrances, stairs, ra
   assert.equal(world.stairSurface(stairs.centerX-stairs.laneOffset,middleZ,stairs.position.y),null,'upper steps cannot capture a player standing beneath them');
   place(stairs.centerX-stairs.laneOffset,stairs.position.y,middleZ);
   walker.update(1/60,new THREE.Vector2(),[],false);
-  assert.ok(Math.abs(walker.group.position.y-stairs.position.y)<.05,'no jump to a staircase above the player');
+  assert.ok(Math.abs(walker.group.position.y-stairs.position.y-CITY_VOXEL_SIZE/2)<.05,'stand on the physical slab without jumping to a staircase above the player');
   world.dispose();
 });
 
@@ -1610,7 +1621,7 @@ test('damaged outdoor stairs support their surviving column and full destruction
   const feet=world.supportHeight(center.x,center.z,before);
   assert.ok(Math.abs(feet-(before-S))<1e-5,'physics receives the same exposed tread height');
   for(const p of world.interiorPieces.filter(p=>p.mesh.userData.walkSurfaceIds?.includes(surface.id)))world.eraseSceneVoxels(p,Array.from(p.mask.keys()));
-  for(let i=0;i<50;i++)world.flushStaticDamage();
+  drain(world);
   assert.equal(grid.surfaces.at(center.x,center.z).some(s=>s.id===surface.id),false,'a fully removed tread no longer supports the body');
   const ray=new THREE.Raycaster(new THREE.Vector3(center.x,1,center.z),new THREE.Vector3(0,-1,0));
   const earth:THREE.Object3D[]=[];scene.traverse(o=>{if(o instanceof THREE.Mesh&&o.userData.terrainFoundation)earth.push(o);});

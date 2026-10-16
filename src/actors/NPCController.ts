@@ -1,3 +1,4 @@
+import type { CollisionWorld } from '../engine/CollisionWorld';
 import { GroundPhysics } from '../engine/GroundPhysics';
 import * as THREE from 'three';
 import { ActorRenderBatch } from '../engine/ActorRenderBatch';
@@ -14,6 +15,8 @@ import { SpatialHash } from '../core/SpatialHash';
 import type { PathAvoidance } from '../core/Pathfinding';
 import { RagdollSystem, type RagdollBody } from './RagdollSystem';
 import { MixamoAnimationSystem, type MixamoState } from './MixamoAnimationSystem';
+import type { NPCMind } from './NPCMind';
+import { NPCLifeSystem } from './NPCLifeSystem';
 
 type State = 'commute' | 'flee' | 'hide' | 'patrol' | 'chase' | 'cover' | 'flank' | 'surrender';
 type Kind = 'civilian' | 'enemy';
@@ -23,6 +26,7 @@ type CharacterRig = { body: THREE.Group; hips: THREE.Group; head: THREE.Group; f
   heavy: boolean; mount: THREE.Group; flash?: THREE.Mesh; parts: Partial<Record<BodyPart, THREE.Mesh>>;
   springs: Map<THREE.Object3D, THREE.Vector3> };
 export type NPC = {
+  mind?: NPCMind;
   id: number; kind: Kind; group: THREE.Group; state: State; home: Cell; work: Cell; target: Cell;
   path: number[]; pathIndex: number; speed: number; panic: number; stamina: number; loyalty: number;
   leader: boolean; memory: number; reroute: number; alive: boolean; direction: number;
@@ -69,8 +73,34 @@ export class NPCController {
   private readonly actorBatch: ActorRenderBatch;
   private readonly mixamo = new MixamoAnimationSystem();
   private streetActivity = 1;
+  private hour = 12;
+  private readonly playerVelocity = new THREE.Vector3();
+  readonly life: NPCLifeSystem;
+  private nextCorpseCleanup=0;
+  private readonly previousPositions=new WeakMap<THREE.Group,THREE.Vector3>();
+  private readonly renderPositions=new WeakMap<THREE.Group,THREE.Vector3>();
+  private readonly renderGroups:THREE.Group[]=[];
+  beginRender(alpha:number):void {
+    for(const npc of this.npcs) {
+      const group=npc.group,previous=this.previousPositions.get(group);
+      if(!npc.alive||!group.parent||!previous||group.position.distanceToSquared(previous)>4)continue;
+      let position=this.renderPositions.get(group);
+      if(!position){position=new THREE.Vector3();this.renderPositions.set(group,position);}
+      this.renderGroups.push(group);position.copy(group.position);group.position.lerpVectors(previous,position,THREE.MathUtils.clamp(alpha,0,1));
+    }
+  }
+  endRender():void {for(const group of this.renderGroups)group.position.copy(this.renderPositions.get(group)!);this.renderGroups.length=0;}
+  private readonly unsubscribers:Array<()=>void>=[];
+  private collisionWorld:CollisionWorld|null=null;
+  private readonly motionDelta=new THREE.Vector3();
+  private readonly collisionPoint=new THREE.Vector3();
+  setCollisionWorld(world:CollisionWorld):void{this.collisionWorld=world;}
 
-  setStreetActivity(activity: number): void { this.streetActivity = THREE.MathUtils.clamp(activity, 0.2, 1); }
+  setStreetActivity(activity: number, hour = this.hour): void {
+    this.streetActivity = THREE.MathUtils.clamp(activity, 0.2, 1); this.hour = hour;
+  }
+
+  setPlayerVelocity(velocity: THREE.Vector3): void { this.playerVelocity.copy(velocity); }
 
   refreshSpatial(): void { this.spatial.rebuild(this.npcs.filter((npc) => npc.alive && !npc.ragdoll && !npc.offDuty &&
     (npc.group.position.distanceToSquared(this.player.position) < 18 * 18 ||
@@ -85,6 +115,11 @@ export class NPCController {
 
   constructor(private scene: THREE.Scene, private grid: GridSystem, private events: EventBus, private destruction: DestructionSystem, private player: THREE.Object3D, private prefabs: PrefabManager, private ragdolls: RagdollSystem, activity = 1) {
     this.actorBatch = new ActorRenderBatch(scene);
+    this.life = new NPCLifeSystem(this.npcs, grid, prefabs, player, {
+      position: npc => npc.ragdoll ? ragdolls.pelvis(npc.ragdoll) : npc.group.position,
+      visible: (from, to) => this.perceptionClear(from, to),
+      route: (npc, cell) => this.route(npc, cell)
+    });
     this.streetActivity = activity;
     void this.mixamo.load();
     this.worker = new Worker(new URL('../workers/path.worker.ts', import.meta.url), { type: 'module' });
@@ -94,7 +129,7 @@ export class NPCController {
       this.requests.delete(event.data.id);
     };
     this.spawn();
-    this.events.on('terrainChanged', ({ cells }) => {
+    this.unsubscribers.push(this.events.on('terrainChanged', ({ cells }) => {
       const changed = [...new Set(cells)];
       if (!changed.length) return;
       this.worker.postMessage({ type: 'update',...grid.navigationData(changed.map(index=>grid.cells[index])) });
@@ -102,14 +137,16 @@ export class NPCController {
       this.npcs.forEach((npc) => {
         if (npc.path.some((index) => affected.has(index%(grid.size*grid.size))) || affected.has(grid.index(npc.target.x, npc.target.z))) npc.reroute = 0;
       });
-    });
-    this.events.on('blast', ({ x, z, radius, source }) => {
+    }));
+    this.unsubscribers.push(this.events.on('blast', ({ x, z, radius, source }) => {
       this.lastDanger.set(x, 0, z);
       if (source === 'player') this.blastCount++;
       for (const npc of this.npcs) {
         if (!npc.alive) continue;
         const distance = Math.hypot(npc.group.position.x - x, npc.group.position.z - z);
         if (distance < radius) {
+          this.life.incident(npc, 'explosion', new THREE.Vector3(x, npc.group.position.y, z),
+            0.7 + 0.3 * (1 - distance / radius), source === 'player' && this.perceptionClear(npc.group.position, this.player.position));
           if (npc.kind === 'civilian') {
             npc.panic = Math.max(npc.panic, 0.75 + (1 - distance / radius) * 0.25);
             npc.state = 'flee';
@@ -121,15 +158,16 @@ export class NPCController {
           } else npc.state = 'chase';
         }
       }
-    });
-    this.events.on('environment', ({ x, z, kind }) => {
+    }));
+    this.unsubscribers.push(this.events.on('environment', ({ x, z, kind }) => {
       for (const npc of this.npcs) {
         if (!npc.alive || Math.hypot(npc.group.position.x - x, npc.group.position.z - z) > 7) continue;
+        this.life.incident(npc, 'explosion', new THREE.Vector3(x, npc.group.position.y, z), kind === 'electric' ? 0.9 : 0.5, false);
         if (npc.kind === 'civilian') { npc.state = 'flee'; npc.panic = Math.max(npc.panic, kind === 'electric' ? 0.9 : 0.5); this.flee(npc, x, z); }
         else { npc.hazardTime = 5; if (kind === 'electric') { npc.stamina -= 0.4; if (npc.stamina <= 0) this.remove(npc); } }
       }
-    });
-    this.events.on('gunshot', ({ x, z, radius }) => {
+    }));
+    this.unsubscribers.push(this.events.on('gunshot', ({ x, z, radius }) => {
       // Player weapons emit this event. Keep the actual shooter as the danger
       // source even when the muzzle sits off-center or the player is moving.
       const sourceX = this.player.position.x, sourceZ = this.player.position.z;
@@ -140,16 +178,30 @@ export class NPCController {
         const distance = Math.hypot(npc.group.position.x - x, npc.group.position.z - z);
         if (distance > radius) continue;
         if (npc.kind === 'civilian') {
+          const recognised = this.perceptionClear(npc.group.position, this.player.position);
+          this.life.incident(npc, 'gunshot', new THREE.Vector3(sourceX, this.player.position.y, sourceZ),
+            0.6 + (1 - distance / radius) * 0.35, recognised);
           if (npc.state === 'flee' || npc.state === 'hide' || npc.panic >= 0.15) continue;
-          const courage = this.grid.hash(npc.id, 918, 55);
+          const courage = this.life.mind(npc).personality.courage;
           const startle = this.grid.hash(npc.id, this.reactionSequence, 911);
           npc.state = 'flee'; npc.panic = Math.max(npc.panic, 0.38 + (1 - distance / radius) * 0.4);
           // Different people freeze for different lengths of time before they run.
           npc.fearTime = startle < 0.24 ? 1.05 + courage * 0.45 : 0.32 + courage * 0.42;
-          this.flee(npc, sourceX, sourceZ, true, true);
+          this.flee(npc, sourceX, sourceZ, true, recognised);
         } else if (npc.state !== 'surrender') npc.state = 'chase';
       }
-    });
+    }));
+    this.unsubscribers.push(this.events.on('enemyShot', ({ fromX, fromY, fromZ }) => {
+      const source = new THREE.Vector3(fromX, fromY - 1.5, fromZ);
+      for (const npc of this.npcs) {
+        if (!npc.alive || npc.kind !== 'civilian' || npc.group.position.distanceToSquared(source) > 30 ** 2) continue;
+        this.life.incident(npc, 'gunshot', source, 0.7, false);
+        if (npc.state === 'flee' || npc.state === 'hide') continue;
+        npc.state = 'flee'; npc.panic = Math.max(npc.panic, 0.65);
+        npc.fearTime = 0.3 + (1 - this.life.mind(npc).personality.courage) * 0.6;
+        this.flee(npc, source.x, source.z, true, false);
+      }
+    }));
   }
 
   raycast(raycaster: THREE.Raycaster): { npc: NPC; point: THREE.Vector3; distance: number; part: BodyPart } | null {
@@ -180,6 +232,7 @@ export class NPCController {
   /** A weapon held on a visible character is a threat even without firing. */
   intimidate(npc: NPC, source: THREE.Vector3): boolean {
     if (!npc.alive || npc.ragdoll) return false;
+    this.life.incident(npc, 'threat', source, 0.85, true);
     if (npc.kind === 'enemy') {
       if (npc.state === 'surrender') return false;
       npc.fearTime = Math.max(npc.fearTime || 0, 0.72);
@@ -216,6 +269,8 @@ export class NPCController {
 
   damage(npc: NPC, amount: number, part: BodyPart = 'torso', point?: THREE.Vector3, limbTrauma = amount): boolean {
     if (!npc.alive || npc.pendingDeath) return npc.pendingDeath;
+    this.life.incident(npc, 'injury', this.player.position, Math.min(1, 0.45 + amount * 0.35),
+      this.perceptionClear(npc.group.position, this.player.position));
     const healthScale = part === 'head' ? 4.5 : part === 'torso' ? 1 : 0.75;
     npc.stamina -= amount * healthScale;
     npc.state = npc.kind === 'enemy' ?
@@ -233,6 +288,7 @@ export class NPCController {
       const fatal = npc.stamina <= 0;
       npc.pendingDeath = fatal;
       npc.hitReaction = { age: 0, duration: fatal ? 4.6 : 1.8, fatal, direction: impulse.clone().setY(0).normalize() };
+      npc.knockback.copy(impulse).setY(0).multiplyScalar(0.6);
       npc.knockdownTime = fatal ? Infinity : 1.8;
       npc.velocity?.set(0, 0, 0);
     }
@@ -610,6 +666,7 @@ export class NPCController {
     for (const npc of far.slice(0, Math.max(0, civilians.length - 105))) {
       if (npc.ragdoll) this.ragdolls.remove(npc.ragdoll);
       npc.alive = false;
+      this.actorBatch?.remove(npc.group);this.mixamo.remove(npc.group.userData.rig.body);this.life.interrupt(npc);
       this.scene.remove(npc.group);
       this.latestRoutes.delete(npc.id);
       this.npcs.splice(this.npcs.indexOf(npc), 1);
@@ -681,6 +738,10 @@ export class NPCController {
     }
     if (npc.ragdoll) this.ragdolls.setExpression(npc.ragdoll, 'dead');
     npc.alive = false;
+    this.actorBatch?.remove(npc.group);
+    this.mixamo.remove(npc.group.userData.rig.body);
+    this.spatial.remove(npc);
+    this.life?.interrupt(npc);
     this.latestRoutes.delete(npc.id);
     this.scene.remove(npc.group);
     if (npc.leader) this.leaderLost = true;
@@ -689,6 +750,8 @@ export class NPCController {
 
   hitByVehicle(npc: NPC, force: number, heading: THREE.Vector3): void {
     if (!npc.alive || npc.knockdownTime > 0) return;
+    // The collision alone doesn't tell a witness who was driving.
+    this.life.incident(npc, 'injury', npc.group.position, Math.min(1, force * 0.3), false);
     npc.stamina -= force;
     const direction = heading.clone().setY(0).normalize();
     this.events.emit('blood', { x: npc.group.position.x, y: npc.group.position.y + 1.05, z: npc.group.position.z,
@@ -696,7 +759,7 @@ export class NPCController {
       count: THREE.MathUtils.clamp(Math.round(force * 5), 7, 22), floor: npc.group.position.y });
     npc.pendingDeath = npc.stamina <= 0;
     npc.knockdownTime = npc.pendingDeath ? Infinity : 1.8;
-    npc.knockback.copy(direction).multiplyScalar(5.5);
+    npc.knockback.copy(direction).multiplyScalar(Math.min(9, 1.4 + force * 1.7) * 72 / this.life.mind(npc).personality.mass);
     npc.path = [];
     npc.pauseTime = 0;
     if (npc.kind === 'civilian') {
@@ -721,7 +784,9 @@ export class NPCController {
     const reaction=npc.hitReaction!,rig=npc.group.userData.rig as CharacterRig;
     this.mixamo.stop(rig.body);
     npc.marker.visible=false;
-    const fall=Math.min(1,reaction.age/.46),ease=fall*fall*(3-2*fall);
+    const fall=Math.min(1,reaction.age/.46);
+    const recover = reaction.fatal ? 0 : THREE.MathUtils.smoothstep(reaction.age, Math.max(0.5,reaction.duration-.7), reaction.duration);
+    const ease=fall*fall*(3-2*fall)*(1-recover);
     const breath=reaction.fatal&&reaction.age>0.48&&reaction.age<3.65?Math.sin(reaction.age*3.1)*.035:0;
     rig.body.rotation.set(breath,0,Math.sin(reaction.age*1.7)*.018);
     rig.hips.position.y=1.32-.84*ease;
@@ -741,7 +806,21 @@ export class NPCController {
   }
 
   update(dt: number): void {
+    for(const npc of this.npcs) {
+      let previous=this.previousPositions.get(npc.group);
+      if(!previous){previous=new THREE.Vector3();this.previousPositions.set(npc.group,previous);}
+      previous.copy(npc.group.position);
+    }
     this.simulationTime += dt;
+    if(this.simulationTime>=this.nextCorpseCleanup) {
+      for(let i=this.npcs.length-1;i>=0;i--) {
+        const npc=this.npcs[i];if(npc.alive||npc.ragdoll&&this.ragdolls.active(npc.ragdoll))continue;
+        this.actorBatch?.remove(npc.group);this.mixamo.remove(npc.group.userData.rig.body);this.spatial.remove(npc);
+        this.npcs.splice(i,1);
+      }
+      this.nextCorpseCleanup=this.simulationTime+2;
+    }
+    this.life.update(this.simulationTime);
     this.refreshSpatial();
     this.vehicleSpatial.rebuild(this.prefabs.vehicles.filter((vehicle) => !vehicle.userData.destroyed && !vehicle.userData.offDutyTraffic &&
       (vehicle.position.distanceToSquared(this.player.position) < 18 * 18 ||
@@ -767,6 +846,7 @@ export class NPCController {
       }
       this.updateBleeding(npc, dt);
       if (!npc.alive) continue;
+      if (!npc.ragdoll && npc.knockback.lengthSq() > 0.0025) this.advanceImpact(npc, dt);
       if (npc.hitReaction) {
         const reaction=npc.hitReaction;
         reaction.age+=dt;
@@ -797,7 +877,8 @@ export class NPCController {
           continue;
         }
         npc.knockdownTime = Math.max(0, npc.knockdownTime - dt);
-        if (npc.knockdownTime === 0 && !npc.ragdoll.recovery) this.ragdolls.startRecovery(npc.ragdoll, npc.group.rotation.y);
+        if (npc.knockdownTime === 0 && !npc.ragdoll.recovery && this.ragdolls.canRecover(npc.ragdoll))
+          this.ragdolls.startRecovery(npc.ragdoll, npc.group.rotation.y);
         if (this.ragdolls.recoveryFinished(npc.ragdoll)) {
           const resting = this.ragdolls.pelvis(npc.ragdoll);
           npc.group.position.set(resting.x, npc.ragdoll.recovery!.anchor.y, resting.z);
@@ -832,7 +913,8 @@ export class NPCController {
         this.animate(npc,npc.group.userData.rig as CharacterRig,dt,true,false);
         continue;
       }
-      const playerNearby = npc.kind === 'civilian' && Math.abs(npc.group.position.y - playerPosition.y) < 1.3 &&
+      const playerNearby = npc.kind === 'civilian' && (npc.fleeFromPlayer || (npc.mind?.suspicion ?? 0) > 0.45) &&
+        Math.abs(npc.group.position.y - playerPosition.y) < 1.3 &&
         distanceSquared < 14 * 14;
       if (distanceSquared < 155 * 155) {
         if (npc.group.parent !== this.scene) this.scene.add(npc.group);
@@ -874,9 +956,13 @@ export class NPCController {
       }
       npc.reroute -= dt;
       if (this.hasLostArm(npc)) {
-        npc.state = 'flee';
         npc.shotTimer = Infinity;
-        if (npc.reroute <= 0 || npc.pathIndex >= npc.path.length) this.flee(npc, playerPosition.x, playerPosition.z);
+        const safeAfterAid = npc.mind?.aidReceived && npc.panic < 0.3 && !playerNearby;
+        npc.state = safeAfterAid ? 'commute' : 'flee';
+        if (npc.reroute <= 0 || npc.pathIndex >= npc.path.length) {
+          if (safeAfterAid) this.route(npc, npc.home);
+          else this.flee(npc, npc.fleeSource?.x ?? this.lastDanger.x, npc.fleeSource?.y ?? this.lastDanger.z);
+        }
         this.move(npc, dt);
         continue;
       }
@@ -888,7 +974,7 @@ export class NPCController {
       npc.hazardTime = Math.max(0, npc.hazardTime - dt);
       npc.shotTimer = Math.max(0, npc.shotTimer - dt);
       if (npc.kind === 'civilian') {
-        npc.needRest = Math.min(1, npc.needRest + dt * 0.0013);
+        npc.needRest = npc.mind?.fatigue ?? Math.min(1, npc.needRest + dt * 0.0013);
         if (npc.state === 'hide' && playerNearby && distanceSquared < 8 * 8) {
           npc.state = 'flee';
           npc.hideTime = 0;
@@ -913,9 +999,8 @@ export class NPCController {
             this.flee(npc, playerPosition.x, playerPosition.z, false, true);
           }
         } else if (npc.pathIndex >= npc.path.length && npc.reroute <= 0) {
-          npc.direction *= -1;
-          if (npc.direction > 0) npc.needRest = Math.max(0, npc.needRest - 0.55);
-          this.route(npc, npc.direction > 0 ? npc.work : npc.home);
+          if (npc.mind?.partner === undefined && npc.mind?.patient === undefined)
+            this.route(npc, this.life.destination(npc, this.hour));
         }
       } else {
         const distance = npc.group.position.distanceTo(playerPosition);
@@ -961,7 +1046,7 @@ export class NPCController {
     }
     this.refreshSpatial();
     this.propagatePanic(dt);
-    this.resolveCrowding(playerPosition);
+    this.resolveCrowding(playerPosition, dt);
   }
 
   private propagatePanic(dt: number): void {
@@ -1047,6 +1132,47 @@ export class NPCController {
     return true;
   }
 
+  private perceptionClear(from: THREE.Vector3, to: THREE.Vector3): boolean {
+    if (Math.abs(from.y - to.y) > 1.6) return false;
+    const distance = Math.hypot(to.x - from.x, to.z - from.z);
+    if (distance > 35) return false;
+    for (let step = 0.5; step < distance - 0.3; step += 0.75) {
+      const t = step / distance;
+      if (this.prefabs.interiorObstacleAt(THREE.MathUtils.lerp(from.x, to.x, t),
+        THREE.MathUtils.lerp(from.z, to.z, t), THREE.MathUtils.lerp(from.y, to.y, t))) return false;
+    }
+    return true;
+  }
+
+  /** Root momentum follows the articulated fall and is swept against the same world as walking. */
+  private advanceImpact(npc: NPC, dt: number): void {
+    if(this.collisionWorld) {
+      const p=npc.group.position;
+      npc.groundPhysics??=new GroundPhysics();
+      const floor=this.prefabs.supportHeight(p.x,p.z,p.y);
+      this.motionDelta.copy(npc.knockback).multiplyScalar(dt);
+      this.motionDelta.y=npc.groundPhysics.step(p.y,Math.min(p.y,floor),dt)-p.y;
+      const contact=this.collisionWorld.move(p,this.motionDelta,.3,npc.hitReaction?.fatal ? .6 : 1.2);
+      p.copy(contact.position);npc.groundPhysics.contact(contact.grounded,contact.ceiling);
+      npc.knockback.multiplyScalar(Math.exp(-dt*5));this.spatial.update(npc);return;
+    }
+    const elapsed = Math.min(dt, 0.1), distance = npc.knockback.length() * elapsed;
+    const steps = Math.max(1, Math.ceil(distance / 0.12)), h = elapsed / steps;
+    for (let i = 0; i < steps; i++) {
+      const x = npc.group.position.x + npc.knockback.x * h;
+      const z = npc.group.position.z + npc.knockback.z * h;
+      if (this.canOccupy(npc, x, npc.group.position.z)) npc.group.position.x = x;
+      else npc.knockback.x = 0;
+      if (this.canOccupy(npc, npc.group.position.x, z)) npc.group.position.z = z;
+      else npc.knockback.z = 0;
+      npc.knockback.multiplyScalar(Math.exp(-h * 5));
+    }
+    this.spatial.update(npc);
+    const floor = this.prefabs.supportHeight(npc.group.position.x, npc.group.position.z, npc.group.position.y);
+    npc.groundPhysics ??= new GroundPhysics();
+    npc.group.position.y = npc.groundPhysics.step(npc.group.position.y, floor, elapsed);
+  }
+
   negotiate(position: THREE.Vector3): 'none' | 'captured' | 'betrayal' {
     const npc = this.npcs.find((candidate) => candidate.alive && candidate.kind === 'enemy' && candidate.state === 'surrender' && candidate.group.position.distanceTo(position) < 5);
     if (!npc) return 'none';
@@ -1066,9 +1192,13 @@ export class NPCController {
       return;
     }
     if (npc.pauseTime > 0 && npc.kind === 'civilian' && npc.state !== 'flee') {
-      const partner = this.spatial.nearby(npc.group.position.x, npc.group.position.z, 4).find((other) => other !== npc && other.kind === 'civilian' && other.pauseTime > 0 && other.group.position.distanceToSquared(npc.group.position) < 12);
-      if (partner) {
-        const delta = partner.group.position.clone().sub(npc.group.position);
+      const mind = npc.mind, partner = this.life.person(mind?.partner);
+      const attention = mind?.attention;
+      const person = attention?.kind === 'person' ? this.life.person(attention.id) : undefined;
+      const target = partner?.group.position ?? (attention?.kind === 'player' ? this.player.position :
+        person ? person.group.position : undefined);
+      if (target) {
+        const delta = target.clone().sub(npc.group.position);
         const heading = Math.atan2(delta.x, delta.z);
         const turn = Math.atan2(Math.sin(heading - npc.group.rotation.y), Math.cos(heading - npc.group.rotation.y));
         npc.group.rotation.y += turn * Math.min(1, dt * 4);
@@ -1083,7 +1213,9 @@ export class NPCController {
           npc.group.rotation.y += turn * Math.min(1, dt * 1.7);
         }
       }
-      this.animate(npc, rig, dt, false, Boolean(partner));
+      const speaking = partner && mind?.activity === 'talk' ? (Math.floor((this.simulationTime - mind.conversationAt) / 2) % 2 === 0) === (npc.id < partner.id) :
+        mind?.activity === 'greet' && this.simulationTime < mind.activityUntil - 1;
+      this.animate(npc, rig, dt, false, Boolean(speaking));
       return;
     }
     if (npc.state === 'surrender') {
@@ -1107,8 +1239,8 @@ export class NPCController {
           this.animate(npc, rig, dt, false, false);
           return;
         }
-        const dwell = npc.role === 'keeper' ? 25 : npc.role === 'visitor' ? 8 : npc.role === 'shopper' ? 6 : npc.role === 'worker' ? 4 : 5;
-        npc.pauseTime = dwell + this.grid.hash(npc.id, Math.floor(this.simulationTime), 25) * 6;
+        if (npc.state === 'commute' && npc.mind?.patient === undefined) this.life.arrived(npc);
+        else npc.pauseTime = 1;
         npc.path = []; npc.pathIndex = 0;
       }
       this.animate(npc, rig, dt, false, false);
@@ -1117,7 +1249,7 @@ export class NPCController {
     direction.normalize();
     const speed = npc.speed * (npc.state === 'flee' ? 1.95 : npc.state === 'chase' || npc.state === 'flank' ? 1.45 : 1) *
       (npc.kind === 'civilian' ? 1 - npc.needRest * 0.25 : 1) * (npc.hazardTime > 0 ? 0.6 : 1) *
-      (this.hasLostArm(npc) ? 0.29 : 1);
+      (this.hasLostArm(npc) ? 0.29 : 1) * (npc.mind?.personality.pace ?? 1) * (1 - (npc.mind?.pain ?? 0) * 0.28);
     npc.velocity ||= new THREE.Vector3();
     npc.velocity.lerp(direction.clone().multiplyScalar(speed), Math.min(1, dt * (npc.state === 'flee' ? 8 : 5.5)));
     const step = Math.min(direction.length() + 0.1, npc.velocity.length() * dt);
@@ -1184,7 +1316,7 @@ export class NPCController {
   private canOccupy(npc: NPC, x: number, z: number): boolean {
     if (!this.grid.walkable(x, z)) return false;
     const support=this.grid.surfaces.reachable(x,z,npc.group.position.y)?.height??this.grid.groundHeight(x,z);
-    if(Math.abs(support-npc.group.position.y)>.55||this.prefabs.interiorObstacleAt(x,z,support))return false;
+    if(Math.abs(support-npc.group.position.y)>.55||(this.collisionWorld?this.collisionWorld.overlaps(this.collisionPoint.set(x,support+.002,z),.28,2.36):this.prefabs.interiorObstacleAt(x,z,support)))return false;
     if (this.player.visible && Math.abs(npc.group.position.y - this.player.position.y) < 0.9 &&
       Math.hypot(this.player.position.x - x, this.player.position.z - z) < 1.02) return false;
     for (const other of this.spatial.nearby(x, z, 1.5)) {
@@ -1214,12 +1346,28 @@ export class NPCController {
     return false;
   }
 
-  private resolveCrowding(player: THREE.Vector3): void {
+  private resolveCrowding(player: THREE.Vector3, dt: number): void {
     const nearby = this.npcs.filter((npc) => npc.alive && !npc.ragdoll && npc.group.position.distanceToSquared(player) < 95 * 95);
     if (this.player.visible) for (const npc of nearby) {
       if (Math.abs(npc.group.position.y - player.y) > 0.9) continue;
       let dx = npc.group.position.x - player.x, dz = npc.group.position.z - player.z;
       let distance = Math.hypot(dx, dz);
+      if (npc.kind === 'civilian' && !npc.hitReaction && distance < 1.32 && distance > 0.001) {
+        const approach = (this.playerVelocity.x * dx + this.playerVelocity.z * dz) / distance;
+        const mind = this.life.mind(npc);
+        if (approach > 1.2 && this.simulationTime - mind.lastContact > 1.3) {
+          mind.lastContact = this.simulationTime;
+          this.life.incident(npc, 'bump', player, Math.min(0.5, approach * 0.07), true);
+          npc.knockback.addScaledVector(this.playerVelocity, 0.32 * 72 / mind.personality.mass);
+          if (approach > 5.4) {
+            const direction = new THREE.Vector3(dx / distance, 0, dz / distance);
+            this.life.interrupt(npc);
+            npc.hitReaction = { age: 0, duration: 1.9, fatal: false, direction };
+            npc.knockdownTime = 1.9;
+          }
+          if (mind.irritation > 0.6) this.events.emit('alert', { text: `${mind.name}: Ten cuidado. Déjame pasar.`, tone: 'info' });
+        }
+      }
       if (distance >= 1.02) continue;
       if (distance < 0.001) { dx = npc.id % 2 ? 1 : -1; dz = 0.25; distance = 0; }
       const push = 1.02 - distance;
@@ -1237,7 +1385,7 @@ export class NPCController {
       if (distance >= 0.92) continue;
       if (distance < 0.001) { dx = a.id % 2 ? 1 : -1; dz = b.id % 2 ? 0.5 : -0.5; distance = 0; }
       const directionLength = Math.hypot(dx, dz);
-      const push = (0.92 - distance) * 0.52;
+      const push = (0.92 - distance) * Math.min(0.52, dt * 16);
       const ax = a.group.position.x + dx / directionLength * push, az = a.group.position.z + dz / directionLength * push;
       const bx = b.group.position.x - dx / directionLength * push, bz = b.group.position.z - dz / directionLength * push;
       if (this.canOccupy(a,ax,az)) { a.group.position.set(ax, a.group.position.y, az); this.spatial.update(a); }
@@ -1282,6 +1430,15 @@ export class NPCController {
   }
 
   private animate(npc: NPC, rig: CharacterRig, dt: number, moving: boolean, talking: boolean): void {
+    const distance=npc.group.position.distanceToSquared(this.player.position);
+    if(distance>48*48) {
+      npc.group.userData.animationElapsed=(npc.group.userData.animationElapsed??0)+dt;
+      if(npc.group.userData.animationElapsed<1/15)return;
+      dt=npc.group.userData.animationElapsed;npc.group.userData.animationElapsed=0;
+    }
+    const mind = npc.mind;
+    const helping = mind?.activity === 'help' && mind.helpStarted !== undefined;
+    const greeting = mind?.activity === 'greet';
     const fleeing = npc.state === 'flee';
     const hiding = npc.state === 'hide';
     const frightened = (npc.fearTime || 0) > 0.15;
@@ -1290,12 +1447,13 @@ export class NPCController {
     const idlePhase = (this.simulationTime + npc.id * 2.173) % 22;
     const phoneSide = this.grid.hash(npc.id, 712, 17) > 0.5 ? 1 : 0;
     const phoneUse = !moving && !fleeing && !hiding && !frightened && !combat && !surrendering &&
-      npc.kind === 'civilian' && npc.pauseTime > 1 && idlePhase > 14 && idlePhase < 18 &&
+      !helping && !greeting && mind?.partner === undefined && npc.kind === 'civilian' && npc.pauseTime > 1 && idlePhase > 14 && idlePhase < 18 &&
       this.grid.hash(npc.id, 311, 42) > 0.48;
     setFaceExpression(rig.face, frightened || fleeing || surrendering ? 'scared' :
-      combat || npc.warned ? 'annoyed' : talking || (npc.kind === 'civilian' && npc.pauseTime > 2 && npc.panic < 0.2) ? 'happy' : 'normal');
+      combat || npc.warned || (mind?.irritation ?? 0) > 0.4 || (mind?.suspicion ?? 0) > 0.5 ? 'annoyed' :
+        talking || greeting && (mind?.trust ?? 0) > 0 ? 'happy' : 'normal');
     const speed = moving ? Math.max(npc.velocity?.length() || 0, npc.indoorAnchor ? npc.speed * 0.45 : 0) : 0;
-    const requested: MixamoState = surrendering ? 'surrender' : hiding ? 'crouch' :
+    const requested: MixamoState = surrendering ? 'surrender' : hiding || helping ? 'crouch' :
       (npc.fireTime || 0) > 0.03 ? 'fire' : combat ? 'aim' :
         (fleeing || frightened) ? (moving ? 'run' : 'fear') : moving ? (speed > 2.25 ? 'run' : 'walk') : 'idle';
     const fastGait = requested === 'run' || fleeing;
@@ -1305,11 +1463,12 @@ export class NPCController {
     // actual speed with the spring gait below; keep Mixamo for non-locomotion
     // poses such as idle, fear, aim, and crouch.
     const proceduralGait = requested === 'walk' || requested === 'run';
-    if (proceduralGait) this.mixamo.stop(rig.body);
-    if (!proceduralGait && !phoneUse && this.mixamo.update(rig.body, dt, requested)) {
+    const socialPose = talking || greeting || helping || (mind?.pain ?? 0) > 0.25;
+    if (proceduralGait || socialPose) this.mixamo.stop(rig.body);
+    if (!proceduralGait && !phoneUse && !socialPose && this.mixamo.update(rig.body, dt, requested)) {
       if (combat || (npc.fireTime || 0) > 0.03) this.poseRifleGrip(rig, dt);
       rig.phase += speed * dt * (fleeing ? 5.2 : 4.5);
-      rig.bubble.visible = talking && !frightened;
+      rig.bubble.visible = false;
       if (rig.flash) {
         rig.flash.visible = (npc.fireTime || 0) > 0;
         rig.flash.scale.setScalar(rig.flash.visible ? 1 + Math.sin((npc.fireTime || 0) * 35) * 0.25 : 1);
@@ -1319,6 +1478,7 @@ export class NPCController {
       npc.groundPhysics ??= new GroundPhysics();
       npc.group.position.y = npc.groundPhysics.step(npc.group.position.y, support, dt);
       this.springPose(rig, npc.group, 'z', 0, dt, 10);
+      this.humanPosture(npc, rig, dt, moving);
       return;
     }
     // Gait is driven by distance travelled, so stopping or being blocked does
@@ -1326,11 +1486,12 @@ export class NPCController {
     rig.phase += speed * dt * (fleeing ? 5.2 : 4.5);
     const stride = Math.sin(rig.phase) * rig.motion;
     const lean = hiding ? 0.42 : frightened ? -0.22 : fastGait ? 0.2 : combat ? -0.07 : moving ? 0.045 : 0;
-    const bend = hiding ? 1.04 : 0;
+    const bend = hiding || helping ? 1.04 : 0;
     for (let side = 0; side < 2; side++) {
       const sign = side === 0 ? 1 : -1;
       const swing = stride * sign;
-      this.springPose(rig, rig.legs[side], 'x', hiding ? -0.65 : swing * (fastGait ? 0.9 : 0.68), dt, fastGait ? 17 : 13);
+      const hurtLeg = npc.wounds?.[side === 0 ? 'leftShin' : 'rightShin'] || npc.wounds?.[side === 0 ? 'leftThigh' : 'rightThigh'];
+      this.springPose(rig, rig.legs[side], 'x', hiding || helping ? -0.65 : swing * (fastGait ? 0.9 : 0.68) * (hurtLeg ? 0.65 : 1), dt, fastGait ? 17 : 13);
       this.springPose(rig, rig.knees[side], 'x', bend + Math.max(0, -swing) * (fastGait ? 1.05 : 0.78), dt, 15);
       this.springPose(rig, rig.feet[side], 'x', -rig.knees[side].rotation.x * 0.42, dt, 13);
       const shoulder = rig.arms[side], elbow = rig.elbows[side];
@@ -1360,8 +1521,16 @@ export class NPCController {
         shoulderZ = side === 0 ? -2.35 : 2.35;
         elbowX = -0.25;
       } else if (talking) {
-        shoulderX = side === 0 ? -0.4 + Math.sin(this.simulationTime * 3 + npc.id) * 0.22 : 0;
-        elbowX = -0.35;
+        const dominant = (mind?.personality.handedness ?? 1) === (side === 0 ? -1 : 1);
+        shoulderX = dominant ? -0.4 + Math.sin(this.simulationTime * 3 + npc.id) * 0.22 : -0.06;
+        elbowX = dominant ? -0.5 : -0.15;
+      } else if (greeting) {
+        shoulderX = side === 1 ? -0.7 : 0;
+        shoulderZ = side === 1 ? 0.7 : 0;
+        elbowX = side === 1 ? -1.3 : 0.08;
+      } else if (helping) {
+        shoulderX = -0.85 + Math.sin(this.simulationTime * 2.8 + side) * 0.08;
+        elbowX = -0.55;
       } else if (phoneUse) {
         shoulderX = side === phoneSide ? -1.08 : -0.04;
         shoulderZ = side === phoneSide ? (phoneSide === 0 ? -0.12 : 0.12) : 0;
@@ -1382,7 +1551,7 @@ export class NPCController {
     rig.torso.position.y += ((hiding ? -0.21 : 0.16 - Math.abs(Math.sin(rig.phase)) * 0.035 * rig.motion) - rig.torso.position.y) * (1 - Math.exp(-dt * 10));
     this.springPose(rig, rig.head, 'x', hiding ? 0.24 : frightened ? -0.18 : 0, dt, 9);
     this.springPose(rig, rig.head, 'z', phoneUse ? (phoneSide === 0 ? -0.12 : 0.12) : 0, dt, 8);
-    rig.bubble.visible = talking && !frightened;
+    rig.bubble.visible = false;
     if (rig.flash) {
       rig.flash.visible = (npc.fireTime || 0) > 0;
       rig.flash.scale.setScalar(rig.flash.visible ? 1 + Math.sin((npc.fireTime || 0) * 35) * 0.25 : 1);
@@ -1393,21 +1562,39 @@ export class NPCController {
     npc.groundPhysics??=new GroundPhysics();
     npc.group.position.y=npc.groundPhysics.step(npc.group.position.y,support,dt);
     this.springPose(rig, npc.group, 'z', 0, dt, 10);
+    this.humanPosture(npc, rig, dt, moving);
   }
 
-  orientFaces(cameraPosition: THREE.Vector3, _isometric: boolean, dt: number): void {
+  private humanPosture(npc: NPC, rig: CharacterRig, dt: number, moving: boolean): void {
+    const mind = npc.mind;
+    if (!mind) return;
+    const helping = mind.activity === 'help' && mind.helpStarted !== undefined;
+    const breath = Math.sin(this.simulationTime * (1.7 + mind.stress * 2) + npc.id * 1.31) * (0.006 + mind.stress * 0.004);
+    rig.body.position.y = breath;
+    rig.hips.position.x = moving ? 0 : Math.sin(this.simulationTime * 0.45 + npc.id) * 0.025;
+    rig.hips.position.y += ((helping ? 1.08 : 1.32) - rig.hips.position.y) * (1 - Math.exp(-dt * 7));
+    if (mind.pain > 0.25 && !helping && npc.state !== 'flee') {
+      const side = mind.personality.handedness < 0 ? 0 : 1;
+      this.springPose(rig, rig.arms[side], 'x', -0.35, dt, 8);
+      this.springPose(rig, rig.elbows[side], 'x', -1.1, dt, 8);
+    }
+  }
+
+  orientFaces(_cameraPosition: THREE.Vector3, _isometric: boolean, dt: number): void {
     const blend = 1 - Math.exp(-dt * 9);
     for (const npc of this.npcs) {
       if (!npc.alive || npc.ragdoll || !npc.group.visible) continue;
       if (npc.group.position.distanceToSquared(this.player.position) > 75 * 75) continue;
       const rig = npc.group.userData.rig as CharacterRig;
-      // A head can glance toward the viewer or the target, but cannot turn
-      // through the back of the body. Fleeing civilians keep looking ahead.
-      const lookAt = npc.kind === 'enemy' ? this.player.position : cameraPosition;
-      const looking = npc.state !== 'flee' && npc.state !== 'hide';
-      const relative = Math.atan2(lookAt.x - npc.group.position.x,
-        lookAt.z - npc.group.position.z) - npc.group.rotation.y;
-      const yaw = looking ? THREE.MathUtils.clamp(Math.atan2(Math.sin(relative), Math.cos(relative)), -1.05, 1.05) : 0;
+      const attention = npc.mind?.attention;
+      const person = attention?.kind === 'person' ? this.life.person(attention.id) : undefined;
+      const lookAt = npc.kind === 'enemy' || attention?.kind === 'player' ? this.player.position :
+        person ? (person.ragdoll ? this.ragdolls.pelvis(person.ragdoll) : person.group.position) : attention;
+      const looking = !!lookAt && (attention?.until === undefined || attention.until > this.simulationTime) && npc.state !== 'hide';
+      const relative = lookAt ? Math.atan2(lookAt.x - npc.group.position.x,
+        lookAt.z - npc.group.position.z) - npc.group.rotation.y : 0;
+      const scanning = Math.sin(this.simulationTime * 0.43 + npc.id * 2.173) * 0.22 * (npc.mind?.personality.curiosity ?? 0.4);
+      const yaw = looking ? THREE.MathUtils.clamp(Math.atan2(Math.sin(relative), Math.cos(relative)), -1.05, 1.05) : scanning;
       const turn = Math.atan2(Math.sin(yaw - rig.head.rotation.y), Math.cos(yaw - rig.head.rotation.y));
       rig.head.rotation.y += turn * blend;
     }
@@ -1416,6 +1603,6 @@ export class NPCController {
   get civilians(): number { return this.npcs.filter((n) => n.kind === 'civilian' && n.alive).length; }
   get enemies(): number { return this.npcs.filter((n) => n.kind === 'enemy' && n.alive).length; }
   get panic(): number { return Math.round(this.npcs.filter((n) => n.kind === 'civilian' && n.alive).reduce((sum, n) => sum + n.panic, 0) / Math.max(1, this.civilians) * 100); }
-  renderActors(): void { this.actorBatch?.update(); }
-  dispose(): void { this.actorBatch?.dispose(); this.worker.terminate(); this.mixamo.dispose(); this.woundMaterial.dispose(); }
+  renderActors(camera?: THREE.Camera): void { this.actorBatch?.update(camera); }
+  dispose(): void { this.unsubscribers.forEach(off=>off());this.unsubscribers.length=0;this.requests.clear();this.latestRoutes.clear();this.actorBatch?.dispose(); this.worker.terminate(); this.mixamo.dispose(); this.woundMaterial.dispose(); }
 }

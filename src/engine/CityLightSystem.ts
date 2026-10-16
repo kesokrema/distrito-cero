@@ -7,6 +7,7 @@ export class CityLightSystem {
   private readonly lights: THREE.PointLight[] = [];
   private elapsed = 0;
   private readonly origin = new THREE.Vector3();
+  dispose():void {for(const light of this.lights){this.scene.remove(light);light.dispose();}this.lights.length=0;}
 
   constructor(private scene: THREE.Scene, private prefabs: PrefabManager) {
     for (let i = 0; i < 12; i++) {
